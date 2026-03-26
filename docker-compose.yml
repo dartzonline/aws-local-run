@@ -1,0 +1,14 @@
+version: "3.8"
+services:
+  localrun:
+    build: .
+    container_name: localrun
+    ports:
+      - "4566:4566"
+    environment:
+      - LOCALRUN_LOG_LEVEL=INFO
+    volumes:
+      - localrun-data:/opt/localrun/data
+    restart: unless-stopped
+volumes:
+  localrun-data:

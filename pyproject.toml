@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aws-local-run"
+version = "1.0.0"
+description = "LocalRun — run AWS services locally"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+dependencies = [
+    "flask>=3.0",
+    "click>=8.0",
+    "xmltodict>=0.13",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "boto3>=1.28", "requests"]
+
+[project.scripts]
+aws-local-run = "localrun.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.setuptools.package-data]
+localrun = ["*.html"]
