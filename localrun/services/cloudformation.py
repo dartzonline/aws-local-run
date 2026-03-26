@@ -9,6 +9,8 @@ logger = logging.getLogger("localrun.cloudformation")
 class CloudFormationService:
     def __init__(self):
         self.stacks = {}  # name -> stack dict
+        # injected by gateway for resource provisioning
+        self.engines = {}
 
     def handle(self, req: Request, path: str) -> Response:
         action = req.args.get("Action") or req.form.get("Action", "")
@@ -48,12 +50,15 @@ class CloudFormationService:
         if not name: return error_response("ValidationError", "StackName required", 400)
         if name in self.stacks: return error_response("AlreadyExistsException", f"Stack {name} exists", 400)
         sid = str(uuid.uuid4())
+        template_body = p.get("TemplateBody", "")
         self.stacks[name] = {
             "StackName": name, "StackId": self._arn(name, sid),
             "StackStatus": "CREATE_COMPLETE", "CreationTime": time.time(),
-            "TemplateBody": p.get("TemplateBody", ""),
+            "TemplateBody": template_body,
             "Parameters": [], "Resources": [], "Events": [],
         }
+        # Provision resources from template
+        self._provision_resources(name, template_body)
         logger.info("Created stack: %s", name)
         return self._xml("CreateStack", f"    <StackId>{self.stacks[name]['StackId']}</StackId>")
 
@@ -101,3 +106,106 @@ class CloudFormationService:
 
     def reset(self):
         self.stacks = {}
+
+    def _provision_resources(self, stack_name, template_body):
+        """Parse template body and create resources in the matching service engines."""
+        if not template_body:
+            return
+        try:
+            template = json.loads(template_body)
+        except Exception:
+            try:
+                import yaml
+                template = yaml.safe_load(template_body)
+            except Exception:
+                logger.debug("Could not parse CloudFormation template as JSON or YAML")
+                return
+        resources = template.get("Resources", {})
+        created = []
+        for logical_id, res in resources.items():
+            res_type = res.get("Type", "")
+            props = res.get("Properties", {})
+            try:
+                result = self._create_resource(res_type, props, logical_id)
+                if result:
+                    created.append(result)
+            except Exception as e:
+                logger.warning("CloudFormation: failed to provision %s (%s): %s", logical_id, res_type, e)
+        if stack_name in self.stacks:
+            self.stacks[stack_name]["Resources"] = created
+        logger.info("CloudFormation provisioned %d resources for stack %s", len(created), stack_name)
+
+    def _create_resource(self, res_type, props, logical_id):
+        c = get_config()
+        if res_type == "AWS::S3::Bucket":
+            s3 = self.engines.get("s3")
+            if s3:
+                bucket_name = props.get("BucketName", logical_id.lower())
+                s3.buckets.setdefault(bucket_name, {})
+                logger.info("CloudFormation created S3 bucket: %s", bucket_name)
+                return {"LogicalResourceId": logical_id, "ResourceType": res_type, "PhysicalResourceId": bucket_name}
+
+        elif res_type == "AWS::SQS::Queue":
+            sqs = self.engines.get("sqs")
+            if sqs:
+                queue_name = props.get("QueueName", logical_id)
+                url = sqs._url(queue_name)
+                if url not in sqs.queues:
+                    from localrun.services.sqs import SQSQueue
+                    arn = "arn:aws:sqs:" + c.region + ":" + c.account_id + ":" + queue_name
+                    sqs.queues[url] = SQSQueue(name=queue_name, url=url, arn=arn)
+                logger.info("CloudFormation created SQS queue: %s", queue_name)
+                return {"LogicalResourceId": logical_id, "ResourceType": res_type, "PhysicalResourceId": queue_name}
+
+        elif res_type == "AWS::DynamoDB::Table":
+            dynamodb = self.engines.get("dynamodb")
+            if dynamodb:
+                table_name = props.get("TableName", logical_id)
+                if table_name not in dynamodb.tables:
+                    key_schema = props.get("KeySchema", [{"AttributeName": "id", "KeyType": "HASH"}])
+                    attr_defs = props.get("AttributeDefinitions", [{"AttributeName": "id", "AttributeType": "S"}])
+                    dynamodb.tables[table_name] = {
+                        "TableName": table_name,
+                        "TableArn": "arn:aws:dynamodb:" + c.region + ":" + c.account_id + ":table/" + table_name,
+                        "KeySchema": key_schema,
+                        "AttributeDefinitions": attr_defs,
+                        "CreationDateTime": time.time(),
+                        "ProvisionedThroughput": props.get("ProvisionedThroughput", {"ReadCapacityUnits": 5, "WriteCapacityUnits": 5}),
+                    }
+                    if props.get("GlobalSecondaryIndexes"):
+                        dynamodb.tables[table_name]["GlobalSecondaryIndexes"] = props["GlobalSecondaryIndexes"]
+                    if props.get("LocalSecondaryIndexes"):
+                        dynamodb.tables[table_name]["LocalSecondaryIndexes"] = props["LocalSecondaryIndexes"]
+                    dynamodb.table_items[table_name] = []
+                logger.info("CloudFormation created DynamoDB table: %s", table_name)
+                return {"LogicalResourceId": logical_id, "ResourceType": res_type, "PhysicalResourceId": table_name}
+
+        elif res_type == "AWS::SNS::Topic":
+            sns = self.engines.get("sns")
+            if sns:
+                topic_name = props.get("TopicName", logical_id)
+                arn = "arn:aws:sns:" + c.region + ":" + c.account_id + ":" + topic_name
+                if arn not in sns.topics:
+                    from localrun.services.sns import SNSTopic
+                    sns.topics[arn] = SNSTopic(name=topic_name, arn=arn)
+                logger.info("CloudFormation created SNS topic: %s", topic_name)
+                return {"LogicalResourceId": logical_id, "ResourceType": res_type, "PhysicalResourceId": arn}
+
+        elif res_type == "AWS::SSM::Parameter":
+            ssm = self.engines.get("ssm")
+            if ssm:
+                param_name = props.get("Name", "/" + logical_id)
+                ssm.parameters[param_name] = {
+                    "Name": param_name,
+                    "Type": props.get("Type", "String"),
+                    "Value": props.get("Value", ""),
+                    "Version": 1,
+                    "LastModifiedDate": time.time(),
+                    "ARN": "arn:aws:ssm:" + c.region + ":" + c.account_id + ":parameter" + param_name,
+                    "Description": props.get("Description", ""),
+                    "Tags": [],
+                }
+                logger.info("CloudFormation created SSM parameter: %s", param_name)
+                return {"LogicalResourceId": logical_id, "ResourceType": res_type, "PhysicalResourceId": param_name}
+
+        return None

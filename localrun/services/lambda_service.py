@@ -37,6 +37,7 @@ class LambdaService:
         self.permissions = {}     # func_name -> [statement]
         self.layers_store = {}    # layer_name -> list of layer version dicts
         self.async_errors = {}    # func_name -> list of recent errors (last 10)
+        self.logs_svc = None      # injected by gateway for CloudWatch Logs integration
 
     def handle(self, req: Request, path: str) -> Response:
         method = req.method
@@ -434,6 +435,26 @@ class LambdaService:
 
     # --- Invocation ---
 
+    def _write_to_logs(self, fn_name, message):
+        """Append a log line to CloudWatch Logs /aws/lambda/{fn_name}."""
+        if not self.logs_svc:
+            return
+        try:
+            group = f"/aws/lambda/{fn_name}"
+            stream = iso_timestamp()[:10]  # date-based stream name
+            # Ensure log group exists
+            if group not in self.logs_svc.log_groups:
+                from localrun.services.cloudwatch_logs import LogGroup
+                self.logs_svc.log_groups[group] = LogGroup(name=group)
+            lg = self.logs_svc.log_groups[group]
+            if stream not in lg.streams:
+                from localrun.services.cloudwatch_logs import LogStream
+                lg.streams[stream] = LogStream(name=stream)
+            ls = lg.streams[stream]
+            ls.events.append({"timestamp": int(time.time() * 1000), "message": message})
+        except Exception:
+            pass
+
     def _invoke(self, req, name):
         fn = self.functions.get(name)
         if not fn: return _json_resp({"message": f"Function {name} not found"}, 404)
@@ -446,12 +467,16 @@ class LambdaService:
             return Response("", 202)
         result = self._execute_function(fn, payload)
         resp_body = result.get("body", {})
+        # Write output to CloudWatch Logs
+        log_msg = json.dumps(resp_body, default=str) if not isinstance(resp_body, str) else resp_body
+        self._write_to_logs(fn.name, log_msg)
         resp = Response(
             json.dumps(resp_body, default=str) if not isinstance(resp_body, str) else resp_body,
             200, content_type="application/json",
         )
         if result.get("error"):
             resp.headers["X-Amz-Function-Error"] = "Unhandled"
+            self._write_to_logs(fn.name, f"ERROR: {log_msg}")
         resp.headers["X-Amz-Log-Result"] = ""
         return resp
 
@@ -462,6 +487,10 @@ class LambdaService:
             if isinstance(err_msg, dict):
                 err_msg = err_msg.get("errorMessage", str(err_msg))
             self._record_async_error(fn.name, str(err_msg))
+            self._write_to_logs(fn.name, f"ERROR: {err_msg}")
+        else:
+            body = result.get("body", {})
+            self._write_to_logs(fn.name, json.dumps(body, default=str) if not isinstance(body, str) else body)
 
     def _get_effective_timeout(self, fn):
         t = fn.timeout

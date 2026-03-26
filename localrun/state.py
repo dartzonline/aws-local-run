@@ -58,10 +58,14 @@ def _deserialize(data):
 
 def _engine_state(engine):
     """Return just the data attrs of an engine, skipping injected refs and callables."""
-    skip = {"sqs", "sns"}  # cross-service refs injected by gateway — don't persist
+    # cross-service refs and full engine dicts injected by gateway — don't persist
+    skip = {"sqs", "sns", "lambda_svc", "engines", "s3", "sns_svc"}
     out = {}
     for k, v in vars(engine).items():
         if k.startswith("_") or k in skip or callable(v):
+            continue
+        # skip anything that looks like a service engine (has a handle() method)
+        if hasattr(v, "handle") and callable(v.handle):
             continue
         out[k] = _serialize(v)
     return out

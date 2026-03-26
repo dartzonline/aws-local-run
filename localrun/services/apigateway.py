@@ -18,6 +18,7 @@ class APIGatewayService:
         self.methods = {}      # f"{api_id}/{resource_id}" -> {method: config}
         self.deployments = {}  # api_id -> [deployments]
         self.stages = {}       # api_id -> {name: stage}
+        self.lambda_svc = None  # injected by gateway
 
     def handle(self, req: Request, path: str) -> Response:
         method = req.method
@@ -68,6 +69,14 @@ class APIGatewayService:
             if len(parts) == 3:
                 if method == "GET": return self._list_stages(api_id)
                 if method == "POST": return self._create_stage(req, api_id)
+
+        # Lambda proxy invocation: /{api_id}/{stage}/{resource_path}
+        if len(parts) >= 4:
+            stage_name = parts[2]
+            resource_path = "/" + "/".join(parts[3:])
+            stages = self.stages.get(api_id, {})
+            if stage_name in stages:
+                return self._invoke_proxy(req, api_id, resource_path, method)
 
         return _err("Not found", 404)
 
@@ -199,3 +208,59 @@ class APIGatewayService:
         self.methods = {}
         self.deployments = {}
         self.stages = {}
+
+    def _invoke_proxy(self, req, api_id, resource_path, http_method):
+        """Find a matching resource and invoke Lambda via AWS_PROXY."""
+        if not self.lambda_svc:
+            return _err("Lambda not available for proxy", 500)
+        resources = self.resources.get(api_id, {})
+        matching_resource = None
+        for res in resources.values():
+            if res.get("path") == resource_path:
+                matching_resource = res
+                break
+        if not matching_resource:
+            return _err("No matching resource for " + resource_path, 404)
+        key = self._method_key(api_id, matching_resource["id"], http_method)
+        method_cfg = self.methods.get(key)
+        if not method_cfg or "integration" not in method_cfg:
+            return _err("No integration configured", 404)
+        integration = method_cfg["integration"]
+        if integration.get("type") != "AWS_PROXY":
+            return _err("Only AWS_PROXY is supported", 501)
+        # Extract Lambda function name from URI
+        uri = integration.get("uri", "")
+        fn_name = uri.split(":")[-1] if ":" in uri else uri
+        fn = self.lambda_svc.functions.get(fn_name)
+        if not fn:
+            return _err("Lambda function not found: " + fn_name, 404)
+        # Build API Gateway proxy event
+        event = json.dumps({
+            "httpMethod": http_method,
+            "path": resource_path,
+            "headers": dict(req.headers),
+            "queryStringParameters": dict(req.args) or None,
+            "body": req.get_data(as_text=True) or None,
+            "isBase64Encoded": False,
+            "requestContext": {
+                "resourceId": matching_resource["id"],
+                "httpMethod": http_method,
+                "path": resource_path,
+            },
+        })
+        result = self.lambda_svc._execute_function(fn, event)
+        # Parse Lambda response
+        if isinstance(result, str):
+            try:
+                result = json.loads(result)
+            except Exception:
+                return _resp({"body": result})
+        if isinstance(result, dict) and "statusCode" in result:
+            status = result.get("statusCode", 200)
+            body = result.get("body", "")
+            headers = result.get("headers", {})
+            resp = Response(body, status, content_type="application/json")
+            for k, v in headers.items():
+                resp.headers[k] = v
+            return resp
+        return _resp(result)

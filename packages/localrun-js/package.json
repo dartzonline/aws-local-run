@@ -1,0 +1,45 @@
+{
+  "name": "localrun",
+  "version": "1.0.0",
+  "description": "Node.js client and test helpers for LocalRun — a lightweight local AWS emulator",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "require": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./jest": {
+      "require": "./dist/jest.js",
+      "types": "./dist/jest.d.ts"
+    },
+    "./vitest": {
+      "require": "./dist/vitest.js",
+      "types": "./dist/vitest.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "jest"
+  },
+  "keywords": ["aws", "local", "testing", "localstack", "mock"],
+  "license": "MIT",
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "@types/node": "^20.0.0"
+  },
+  "peerDependencies": {
+    "jest": ">=27.0.0",
+    "vitest": ">=0.30.0"
+  },
+  "peerDependenciesMeta": {
+    "jest": { "optional": true },
+    "vitest": { "optional": true }
+  },
+  "bin": {
+    "localrun": "bin/localrun.js"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  }
+}

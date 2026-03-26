@@ -26,13 +26,45 @@ class FaultManager:
         return self.faults
 
     def add(self, fault: dict) -> str:
-        """Add a new fault and return its ID."""
+        """Add a new fault and return its ID.
+        
+        Supports preset types:
+          dynamodb_throttle - returns ProvisionedThroughputExceededException
+          lambda_cold_start - adds delay before Lambda invocations
+          s3_slow_response  - adds delay before S3 responses
+        """
         import uuid
         fid = uuid.uuid4().hex[:8]
         fault = fault.copy()
         fault["id"] = fid
         # Set defaults
         fault.setdefault("probability", 1.0)
+
+        # Expand preset types into standard fault configs
+        ftype = fault.get("type", "")
+        if ftype == "dynamodb_throttle":
+            fault["type"] = "error"
+            fault["service"] = "dynamodb"
+            fault.setdefault("error_code", 400)
+            fault.setdefault("error_type", "ProvisionedThroughputExceededException")
+            fault.setdefault("error_message", "Rate exceeded for table")
+        elif ftype == "lambda_cold_start":
+            fault["type"] = "latency"
+            fault["service"] = "lambda"
+            fault.setdefault("latency_ms", 3000)
+        elif ftype == "s3_slow_response":
+            fault["type"] = "latency"
+            fault["service"] = "s3"
+            fault.setdefault("latency_ms", 2000)
+        elif ftype == "sqs_message_drop":
+            # Drop SQS messages by intercepting SendMessage with an error response
+            fault["type"] = "error"
+            fault["service"] = "sqs"
+            fault.setdefault("action", "SendMessage")
+            fault.setdefault("error_code", 500)
+            fault.setdefault("error_type", "ServiceUnavailable")
+            fault.setdefault("error_message", "Message dropped by fault injection")
+
         self.faults.append(fault)
         logger.info("Added fault injection config: %s", fault)
         return fid

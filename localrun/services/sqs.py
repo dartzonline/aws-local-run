@@ -306,6 +306,7 @@ class SQSService:
         if not q: return self._err(req, "AWS.SimpleQueueService.NonExistentQueue", "Queue not found")
         max_msgs = int(p.get("MaxNumberOfMessages", "1"))
         vt = int(p.get("VisibilityTimeout", q.attributes.get("VisibilityTimeout", "30")))
+        wait_secs = int(p.get("WaitTimeSeconds", q.attributes.get("ReceiveMessageWaitTimeSeconds", "0")))
 
         # collect requested attribute names so we know what to return
         requested_attr_names = set()
@@ -321,6 +322,7 @@ class SQSService:
                 requested_attr_names.add(p[f"MessageAttributeName.{i}"]); i += 1
 
         now = time.time(); xml = ""; msgs_json = []; count = 0; returned = []
+        deadline = now + wait_secs if wait_secs > 0 else now
 
         if q.is_fifo:
             # find which group IDs have in-flight messages
@@ -345,6 +347,21 @@ class SQSService:
                 msg.visible_after = now + vt; msg.receive_count += 1
                 msg.receipt_handle = str(uuid.uuid4()); count += 1
                 returned.append(msg)
+
+        # Long polling: if no messages and WaitTimeSeconds > 0, poll until deadline
+        if not returned and wait_secs > 0:
+            import time as _time
+            while _time.time() < deadline:
+                _time.sleep(0.2)
+                now = _time.time()
+                for msg in q.messages:
+                    if count >= max_msgs: break
+                    if msg.visible_after > now: continue
+                    msg.visible_after = now + vt; msg.receive_count += 1
+                    msg.receipt_handle = str(uuid.uuid4()); count += 1
+                    returned.append(msg)
+                if returned:
+                    break
 
         want_all_attrs = "All" in requested_attr_names or ".*" in requested_attr_names
 

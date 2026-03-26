@@ -62,18 +62,18 @@ class S3Service:
 
         # versioning: bucket_name -> "Enabled" | "Suspended" | ""
         self.bucket_versioning: dict = {}
-        # object_versions: bucket_name -> {key: [S3Object, ...]}  (oldest first)
-        self.object_versions: dict = {}
+        # bucket_versions: bucket_name -> {key: [S3Object, ...]}  (oldest first)
+        self.bucket_versions: dict = {}
 
         # policies: bucket_name -> raw JSON string
         self.bucket_policies: dict = {}
 
-        # ACLs: bucket_name -> canned ACL string, object key -> canned ACL string
+        # ACLs: bucket_name -> canned ACL string, (bucket, key) -> canned ACL string
         self.bucket_acls: dict = {}
-        self.object_acls: dict = {}  # (bucket, key) -> acl string
+        self.object_acls: dict = {}
 
         # lifecycle rules: bucket_name -> raw XML string
-        self.lifecycle_rules: dict = {}
+        self.bucket_lifecycle: dict = {}
 
         # notifications: bucket_name -> config dict
         self.bucket_notifications: dict = {}
@@ -290,10 +290,9 @@ class S3Service:
                 f"</Contents>"
             )
 
-        prefixes_xml = "".join(
-            f"\n    <CommonPrefixes><Prefix>{cp}</Prefix></CommonPrefixes>"
-            for cp in sorted(common_prefixes)
-        )
+        prefixes_xml = ""
+        for cp in sorted(common_prefixes):
+            prefixes_xml += f"\n    <CommonPrefixes><Prefix>{cp}</Prefix></CommonPrefixes>"
 
         next_token = page[-1].key if (is_truncated and page) else ""
         truncated_str = "true" if is_truncated else "false"
@@ -441,8 +440,24 @@ class S3Service:
         if dest_bucket not in self.buckets:
             return _s3_err("NoSuchBucket", f"Destination bucket '{dest_bucket}' does not exist.", 404)
         new_obj = S3Object(key=dest_key, data=src_obj.data, content_type=src_obj.content_type, metadata=dict(src_obj.metadata))
+
+        versioning = self.bucket_versioning.get(dest_bucket, "")
+        if versioning == "Enabled":
+            new_obj.version_id = uuid.uuid4().hex
+            self._store_version(dest_bucket, dest_key, new_obj)
+
         self.buckets[dest_bucket][dest_key] = new_obj
-        body = f'<?xml version="1.0" encoding="UTF-8"?>\n<CopyObjectResult><ETag>{new_obj.etag}</ETag><LastModified>{new_obj.last_modified}</LastModified></CopyObjectResult>'
+        logger.info("Copied s3://%s/%s -> s3://%s/%s", src_bucket, src_key, dest_bucket, dest_key)
+
+        self._fire_notifications(dest_bucket, dest_key, "s3:ObjectCreated:Copy")
+
+        body = (
+            f'<?xml version="1.0" encoding="UTF-8"?>\n'
+            f'<CopyObjectResult>'
+            f'<ETag>{new_obj.etag}</ETag>'
+            f'<LastModified>{new_obj.last_modified}</LastModified>'
+            f'</CopyObjectResult>'
+        )
         return Response(body, 200, content_type="application/xml")
 
     def _delete_objects(self, req, bucket):
@@ -507,9 +522,18 @@ class S3Service:
             combined += upload["parts"][part_num]
         content_type = "application/octet-stream"
         obj = S3Object(key=key, data=combined, content_type=content_type)
+
+        versioning = self.bucket_versioning.get(bucket, "")
+        if versioning == "Enabled":
+            obj.version_id = uuid.uuid4().hex
+            self._store_version(bucket, key, obj)
+
         self.buckets[bucket][key] = obj
         del self.uploads[upload_id]
         logger.info("Completed multipart upload for s3://%s/%s (%d bytes)", bucket, key, len(combined))
+
+        self._fire_notifications(bucket, key, "s3:ObjectCreated:CompleteMultipartUpload")
+
         body = (
             f'<?xml version="1.0" encoding="UTF-8"?>\n'
             f'<CompleteMultipartUploadResult xmlns="{S3_NS}">\n'
@@ -527,11 +551,11 @@ class S3Service:
     # ─── Versioning ───────────────────────────────────────────────────────────
 
     def _store_version(self, bucket, key, obj):
-        if bucket not in self.object_versions:
-            self.object_versions[bucket] = {}
-        if key not in self.object_versions[bucket]:
-            self.object_versions[bucket][key] = []
-        self.object_versions[bucket][key].append(obj)
+        if bucket not in self.bucket_versions:
+            self.bucket_versions[bucket] = {}
+        if key not in self.bucket_versions[bucket]:
+            self.bucket_versions[bucket][key] = []
+        self.bucket_versions[bucket][key].append(obj)
 
     def _get_bucket_versioning(self, bucket):
         if bucket not in self.buckets:
@@ -568,7 +592,7 @@ class S3Service:
         if bucket not in self.buckets:
             return _s3_err("NoSuchBucket", f"Bucket '{bucket}' does not exist.", 404)
         prefix = req.args.get("prefix", "")
-        versions_map = self.object_versions.get(bucket, {})
+        versions_map = self.bucket_versions.get(bucket, {})
         versions_xml = ""
         for key, ver_list in sorted(versions_map.items()):
             if prefix and not key.startswith(prefix):
@@ -608,7 +632,7 @@ class S3Service:
     def _get_object_version(self, bucket, key, version_id):
         if bucket not in self.buckets:
             return _s3_err("NoSuchBucket", f"Bucket '{bucket}' does not exist.", 404)
-        versions = self.object_versions.get(bucket, {}).get(key, [])
+        versions = self.bucket_versions.get(bucket, {}).get(key, [])
         for ver in versions:
             if ver.version_id == version_id:
                 if ver.is_delete_marker:
@@ -621,16 +645,19 @@ class S3Service:
                 for mk, mv in ver.metadata.items():
                     resp.headers[f"x-amz-meta-{mk}"] = mv
                 return resp
-        return _s3_err("NoSuchVersion", f"The specified version does not exist.", 404)
+        return _s3_err("NoSuchVersion", "The specified version does not exist.", 404)
 
     def _delete_object_version(self, bucket, key, version_id):
         if bucket not in self.buckets:
             return _s3_err("NoSuchBucket", f"Bucket '{bucket}' does not exist.", 404)
-        versions = self.object_versions.get(bucket, {}).get(key, [])
-        new_versions = [v for v in versions if v.version_id != version_id]
+        versions = self.bucket_versions.get(bucket, {}).get(key, [])
+        new_versions = []
+        for v in versions:
+            if v.version_id != version_id:
+                new_versions.append(v)
         if len(new_versions) == len(versions):
             return _s3_err("NoSuchVersion", "The specified version does not exist.", 404)
-        self.object_versions[bucket][key] = new_versions
+        self.bucket_versions[bucket][key] = new_versions
         # If the current latest was this version, update the bucket view
         current = self.buckets[bucket].get(key)
         if current and current.version_id == version_id:
@@ -740,7 +767,7 @@ class S3Service:
     def _get_lifecycle(self, bucket):
         if bucket not in self.buckets:
             return _s3_err("NoSuchBucket", f"Bucket '{bucket}' does not exist.", 404)
-        raw = self.lifecycle_rules.get(bucket)
+        raw = self.bucket_lifecycle.get(bucket)
         if raw is None:
             return _s3_err("NoSuchLifecycleConfiguration", "The lifecycle configuration does not exist.", 404)
         return Response(raw, 200, content_type="application/xml")
@@ -753,19 +780,19 @@ class S3Service:
             ET.fromstring(raw)
         except ET.ParseError:
             return _s3_err("MalformedXML", "The XML you provided was not well-formed.", 400)
-        self.lifecycle_rules[bucket] = raw
+        self.bucket_lifecycle[bucket] = raw
         logger.info("Set lifecycle rules on bucket: %s", bucket)
         return Response("", 200)
 
     def _delete_lifecycle(self, bucket):
         if bucket not in self.buckets:
             return _s3_err("NoSuchBucket", f"Bucket '{bucket}' does not exist.", 404)
-        self.lifecycle_rules.pop(bucket, None)
+        self.bucket_lifecycle.pop(bucket, None)
         return Response("", 204)
 
     def _apply_lifecycle_expiry(self, bucket, key, obj):
         """Check lifecycle rules and annotate obj.expiry_date if a matching rule exists."""
-        raw = self.lifecycle_rules.get(bucket)
+        raw = self.bucket_lifecycle.get(bucket)
         if not raw:
             return
         try:
@@ -798,10 +825,11 @@ class S3Service:
         if bucket not in self.buckets:
             return _s3_err("NoSuchBucket", f"Bucket '{bucket}' does not exist.", 404)
         config = self.bucket_notifications.get(bucket, {})
-        # Return the stored config as JSON; real S3 returns XML but this keeps it simple
         queue_xml = ""
         for qc in config.get("QueueConfigurations", []):
-            events_xml = "".join(f"<Event>{e}</Event>" for e in qc.get("Events", []))
+            events_xml = ""
+            for e in qc.get("Events", []):
+                events_xml += f"<Event>{e}</Event>"
             queue_xml += (
                 f"\n  <QueueConfiguration>"
                 f"<Id>{qc.get('Id', '')}</Id>"
@@ -811,7 +839,9 @@ class S3Service:
             )
         topic_xml = ""
         for tc in config.get("TopicConfigurations", []):
-            events_xml = "".join(f"<Event>{e}</Event>" for e in tc.get("Events", []))
+            events_xml = ""
+            for e in tc.get("Events", []):
+                events_xml += f"<Event>{e}</Event>"
             topic_xml += (
                 f"\n  <TopicConfiguration>"
                 f"<Id>{tc.get('Id', '')}</Id>"
@@ -821,7 +851,9 @@ class S3Service:
             )
         lambda_xml = ""
         for lc in config.get("LambdaFunctionConfigurations", []):
-            events_xml = "".join(f"<Event>{e}</Event>" for e in lc.get("Events", []))
+            events_xml = ""
+            for e in lc.get("Events", []):
+                events_xml += f"<Event>{e}</Event>"
             lambda_xml += (
                 f"\n  <CloudFunctionConfiguration>"
                 f"<Id>{lc.get('Id', '')}</Id>"
@@ -911,8 +943,6 @@ class S3Service:
             return
         topic = self.sns.topics.get(topic_arn)
         if topic:
-            # Re-use SNS delivery machinery by calling _publish_raw if we added it,
-            # or just inject a message for each SQS subscription directly.
             msg_id = str(uuid.uuid4())
             for sub in topic.subscriptions:
                 if sub.protocol == "sqs" and self.sqs:
@@ -980,11 +1010,11 @@ class S3Service:
         self.bucket_created = {}
         self.uploads = {}
         self.bucket_versioning = {}
-        self.object_versions = {}
+        self.bucket_versions = {}
         self.bucket_policies = {}
         self.bucket_acls = {}
         self.object_acls = {}
-        self.lifecycle_rules = {}
+        self.bucket_lifecycle = {}
         self.bucket_notifications = {}
         self.presigned = {}
 

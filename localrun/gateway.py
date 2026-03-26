@@ -1,15 +1,41 @@
 """API gateway — routes requests to the appropriate service engine."""
-import json, logging, time, collections
+import json, logging, time, collections, threading
 from flask import Flask, Request, Response, request
 from localrun.config import get_config
 from localrun.faults import FaultManager
 from localrun.state import StateManager
+from localrun.plugins import load_entry_points, inject_into_engines
 
 logger = logging.getLogger("localrun.gateway")
 fault_manager = FaultManager()
 
 # Ring buffer for request log — keeps last 200 entries
 _request_log = collections.deque(maxlen=200)
+
+
+def _diff_states(snap1, snap2, label1, label2):
+    """Compare two state snapshots and return a structured diff per service."""
+    all_services = set(snap1.keys()) | set(snap2.keys())
+    result = {}
+    for svc in all_services:
+        s1 = snap1.get(svc, {})
+        s2 = snap2.get(svc, {})
+        if not isinstance(s1, dict):
+            s1 = {}
+        if not isinstance(s2, dict):
+            s2 = {}
+        keys1 = set(s1.keys())
+        keys2 = set(s2.keys())
+        added = list(keys2 - keys1)
+        removed = list(keys1 - keys2)
+        changed = []
+        for k in keys1 & keys2:
+            if s1[k] != s2[k]:
+                changed.append(k)
+        if added or removed or changed:
+            result[svc] = {"added": added, "removed": removed, "changed": changed}
+    return {"services": result}
+
 
 def create_app() -> Flask:
     app = Flask("localrun")
@@ -33,32 +59,95 @@ def create_app() -> Flask:
     from localrun.services.kinesis import KinesisService
     from localrun.services.cloudwatch_metrics import CloudWatchService
     from localrun.services.stepfunctions import StepFunctionsService
+    from localrun.services.ses import SESService
+    from localrun.services.cognito import CognitoService
+    from localrun.services.kms import KMSService
+    from localrun.services.ec2 import EC2Service
+    from localrun.services.acm import ACMService
+    from localrun.services.route53 import Route53Service
 
-    engines = {
-        "s3": S3Service(),
-        "sqs": SQSService(),
-        "dynamodb": DynamoDBService(),
-        "sns": SNSService(),
-        "lambda": LambdaService(),
-        "iam": IAMService(),
-        "logs": CloudWatchLogsService(),
-        "sts": STSService(),
-        "secretsmanager": SecretsManagerService(),
-        "ssm": SSMService(),
-        "events": EventBridgeService(),
-        "cloudformation": CloudFormationService(),
-        "rds": RDSService(),
-        "apigateway": APIGatewayService(),
-        "opensearch": OpenSearchService(),
-        "kinesis": KinesisService(),
-        "cloudwatch": CloudWatchService(),
-        "stepfunctions": StepFunctionsService(),
-    }
+    def _make_engines():
+        eng = {
+            "s3": S3Service(),
+            "sqs": SQSService(),
+            "dynamodb": DynamoDBService(),
+            "sns": SNSService(),
+            "lambda": LambdaService(),
+            "iam": IAMService(),
+            "logs": CloudWatchLogsService(),
+            "sts": STSService(),
+            "secretsmanager": SecretsManagerService(),
+            "ssm": SSMService(),
+            "events": EventBridgeService(),
+            "cloudformation": CloudFormationService(),
+            "rds": RDSService(),
+            "apigateway": APIGatewayService(),
+            "opensearch": OpenSearchService(),
+            "kinesis": KinesisService(),
+            "cloudwatch": CloudWatchService(),
+            "stepfunctions": StepFunctionsService(),
+            "ses": SESService(),
+            "cognito": CognitoService(),
+            "kms": KMSService(),
+            "ec2": EC2Service(),
+            "acm": ACMService(),
+            "route53": Route53Service(),
+        }
+        # Wire cross-service references so SNS/EventBridge can deliver to SQS and Lambda
+        eng["sns"].sqs = eng["sqs"]
+        eng["sns"].lambda_svc = eng["lambda"]
+        eng["events"].sqs = eng["sqs"]
+        eng["events"].sns = eng["sns"]
+        eng["events"].lambda_svc = eng["lambda"]
+        eng["s3"].sqs = eng["sqs"]
+        eng["s3"].sns = eng["sns"]
+        eng["s3"].lambda_svc = eng["lambda"]
+        eng["cloudwatch"].sns = eng["sns"]
+        eng["cloudformation"].engines = eng
+        eng["apigateway"].lambda_svc = eng["lambda"]
+        eng["lambda"].logs_svc = eng["logs"]
+        return eng
 
-    # Wire cross-service references so SNS/EventBridge can deliver to SQS
-    engines["sns"].sqs = engines["sqs"]
-    engines["events"].sqs = engines["sqs"]
-    engines["events"].sns = engines["sns"]
+    engines = _make_engines()
+
+    # Multi-region: primary region uses the engines dict already built
+    _region_engines = {}
+    _region_engines[get_config().region] = engines
+
+    # Per-service locks for thread safety
+    _locks = {svc: threading.Lock() for svc in engines}
+    app.config["_locks"] = _locks
+
+    # Rate limiting state
+    _rate_counters = {}  # svc -> {"count": int, "window_start": float}
+    _rate_lock = threading.Lock()
+
+    def _check_rate_limit(svc):
+        limits = get_config().rate_limits if hasattr(get_config(), "rate_limits") else {}
+        limit = limits.get(svc, 0)
+        if limit <= 0:
+            return None  # no limit configured
+        now = time.time()
+        with _rate_lock:
+            entry = _rate_counters.get(svc)
+            if entry is None or now - entry["window_start"] >= 60.0:
+                _rate_counters[svc] = {"count": 1, "window_start": now}
+                return None
+            entry["count"] += 1
+            if entry["count"] > limit:
+                return entry["count"]
+        return None
+
+    def _region_from_auth(req):
+        auth = req.headers.get("Authorization", "")
+        if "Credential=" in auth:
+            parts = auth.split("Credential=")[1].split(",")[0].split("/")
+            if len(parts) >= 4:
+                return parts[2]
+        return None
+
+    load_entry_points()
+    inject_into_engines(engines)
 
     # Store engines on the app so other code can reach them (e.g. seed loader)
     app.config["engines"] = engines
@@ -83,7 +172,23 @@ def create_app() -> Flask:
     @app.route("/health", methods=["GET"])
     @app.route("/_localrun/health", methods=["GET"])
     def health():
-        return {"status": "running", "services": list(engines.keys())}
+        from localrun import __version__
+        svc_stats = {}
+        for name, engine in engines.items():
+            counts = {}
+            if hasattr(engine, "buckets"): counts["buckets"] = len(engine.buckets)
+            if hasattr(engine, "queues"): counts["queues"] = len(engine.queues)
+            if hasattr(engine, "tables"): counts["tables"] = len(engine.tables)
+            if hasattr(engine, "topics"): counts["topics"] = len(engine.topics)
+            if hasattr(engine, "functions"): counts["functions"] = len(engine.functions)
+            if hasattr(engine, "secrets"): counts["secrets"] = len(engine.secrets)
+            if hasattr(engine, "parameters"): counts["parameters"] = len(engine.parameters)
+            if hasattr(engine, "inbox"): counts["inbox"] = len(engine.inbox)
+            svc_stats[name] = counts if counts else "active"
+        return {
+            "status": "running", "version": __version__,
+            "services": svc_stats,
+        }
 
     @app.route("/_localrun/faults", methods=["GET", "POST", "DELETE"])
     def api_faults():
@@ -150,6 +255,29 @@ def create_app() -> Flask:
             names.append(name)
         return Response(json.dumps({"snapshots": names}), 200, content_type="application/json")
 
+    @app.route("/_localrun/state/diff/<name1>/<name2>", methods=["GET"])
+    def api_state_diff(name1, name2):
+        import os, json as _json
+        data_dir = config.data_dir or "."
+
+        def load_snapshot(name):
+            path = os.path.join(data_dir, f"localrun_state_{name}.json")
+            if not os.path.exists(path):
+                return None
+            with open(path) as f:
+                return _json.load(f)
+
+        snap1 = load_snapshot(name1)
+        snap2 = load_snapshot(name2)
+
+        if snap1 is None:
+            return Response(_json.dumps({"error": f"Snapshot '{name1}' not found"}), 404, content_type="application/json")
+        if snap2 is None:
+            return Response(_json.dumps({"error": f"Snapshot '{name2}' not found"}), 404, content_type="application/json")
+
+        diff = _diff_states(snap1, snap2, name1, name2)
+        return Response(_json.dumps(diff), 200, content_type="application/json")
+
     @app.route("/_localrun/reset", methods=["POST"])
     def api_reset():
         svc = request.args.get("service")
@@ -176,7 +304,86 @@ def create_app() -> Flask:
         entries = list(_request_log)
         if svc_filter:
             entries = [e for e in entries if e.get("service") == svc_filter]
+        status_filter = request.args.get("status")
+        if status_filter:
+            try:
+                status_code = int(status_filter)
+                entries = [e for e in entries if e.get("status") == status_code]
+            except ValueError:
+                pass
         return Response(json.dumps({"requests": entries[-limit:]}), 200, content_type="application/json")
+
+    @app.route("/_localrun/regions", methods=["GET"])
+    def api_regions():
+        return Response(json.dumps({"regions": list(_region_engines.keys())}), 200, content_type="application/json")
+
+    @app.route("/_localrun/resources", methods=["GET"])
+    def api_resources():
+        """Return a flat list of all resources across all services."""
+        svc_filter = request.args.get("service")
+        resources = []
+        c = get_config()
+        for svc_name, engine in engines.items():
+            if svc_filter and svc_name != svc_filter:
+                continue
+            if hasattr(engine, "buckets"):
+                for name in engine.buckets:
+                    resources.append({"service": "s3", "type": "bucket", "name": name})
+            if hasattr(engine, "queues"):
+                for q in engine.queues.values():
+                    resources.append({"service": "sqs", "type": "queue", "name": q.name, "arn": q.arn})
+            if hasattr(engine, "tables"):
+                for name, t in engine.tables.items():
+                    resources.append({"service": "dynamodb", "type": "table", "name": name, "arn": t.get("TableArn", "")})
+            if hasattr(engine, "topics"):
+                for arn, t in engine.topics.items():
+                    resources.append({"service": "sns", "type": "topic", "name": t.name, "arn": arn})
+            if hasattr(engine, "functions"):
+                for name, f in engine.functions.items():
+                    resources.append({"service": "lambda", "type": "function", "name": name, "arn": f.arn})
+            if hasattr(engine, "secrets"):
+                for name, s in engine.secrets.items():
+                    if not s.get("deleted"):
+                        resources.append({"service": "secretsmanager", "type": "secret", "name": s.get("Name", name)})
+            if hasattr(engine, "parameters"):
+                for name in engine.parameters:
+                    resources.append({"service": "ssm", "type": "parameter", "name": name})
+            if hasattr(engine, "stacks"):
+                for name, s in engine.stacks.items():
+                    resources.append({"service": "cloudformation", "type": "stack", "name": name, "status": s.get("StackStatus", "")})
+            if hasattr(engine, "streams") and svc_name == "kinesis":
+                for name in engine.streams:
+                    resources.append({"service": "kinesis", "type": "stream", "name": name})
+            if hasattr(engine, "state_machines"):
+                for arn, sm in engine.state_machines.items():
+                    resources.append({"service": "stepfunctions", "type": "stateMachine", "name": sm.get("name", ""), "arn": arn})
+            if hasattr(engine, "roles"):
+                for name, r in engine.roles.items():
+                    resources.append({"service": "iam", "type": "role", "name": name, "arn": r.get("Arn", "")})
+            if hasattr(engine, "user_pools"):
+                for pid, pool in engine.user_pools.items():
+                    resources.append({"service": "cognito", "type": "userPool", "name": pool.get("Name", ""), "id": pid})
+            if hasattr(engine, "log_groups"):
+                for name in engine.log_groups:
+                    resources.append({"service": "logs", "type": "logGroup", "name": name})
+        return Response(json.dumps({"resources": resources, "count": len(resources)}), 200, content_type="application/json")
+
+    @app.route("/_localrun/sns/inbox", methods=["GET"])
+    def sns_inbox():
+        sns = engines.get("sns")
+        if not sns:
+            return Response(json.dumps({"error": "SNS not available"}), 404, content_type="application/json")
+        return Response(json.dumps({
+            "sms": sns.sms_inbox[-50:],
+            "email": sns.email_inbox[-50:],
+        }), 200, content_type="application/json")
+
+    @app.route("/_localrun/ses/inbox", methods=["GET"])
+    def ses_inbox():
+        ses = engines.get("ses")
+        if not ses:
+            return Response(json.dumps({"error": "SES not available"}), 404, content_type="application/json")
+        return Response(json.dumps({"emails": ses.inbox[-50:]}), 200, content_type="application/json")
 
     @app.route("/_localrun/ui", methods=["GET"])
     def dashboard_ui():
@@ -233,7 +440,16 @@ def create_app() -> Flask:
         if not config.enabled_services.get(svc, False):
             return Response(json.dumps({"error": f"Service {svc} is disabled"}), 400, content_type="application/json")
 
-        handler = engines.get(svc)
+        # Multi-region: route to a per-region engine set when the request targets a different region
+        region = _region_from_auth(request)
+        if region and region != get_config().region:
+            if region not in _region_engines:
+                _region_engines[region] = _make_engines()
+                logger.info("Created engine set for region: %s", region)
+            handler = _region_engines[region].get(svc)
+        else:
+            handler = engines.get(svc)
+
         if not handler:
             return Response(json.dumps({"error": f"Service {svc} not implemented"}), 501, content_type="application/json")
 
@@ -250,16 +466,30 @@ def create_app() -> Flask:
             logger.warning("Applied fault to %s %s: %s", svc, action, fault)
             status_code = fault.get("status_code", 500)
             body = f'<?xml version="1.0" encoding="UTF-8"?><ErrorResponse><Error><Code>{fault.get("error_type", "InternalFailure")}</Code><Message>{fault.get("message", "Injected fault error")}</Message></Error></ErrorResponse>'
-            # For JSON protocols we could return JSON, but many clients handle XML errors fine or we can let botocore process it. 
+            # For JSON protocols we could return JSON, but many clients handle XML errors fine or we can let botocore process it.
             # To be safe for newer boto3 JSON requests:
             if "json" in (request.content_type or "") or target:
                 body = json.dumps({"__type": fault.get("error_type", "InternalFailure"), "message": fault.get("message", "Injected fault error")})
                 return Response(body, status_code, content_type="application/x-amz-json-1.0")
             return Response(body, status_code, content_type="application/xml")
 
+        # Check rate limit
+        over_limit = _check_rate_limit(svc)
+        if over_limit is not None:
+            body = json.dumps({"__type": "ThrottlingException", "message": f"Rate exceeded for service {svc}"})
+            return Response(body, 429, content_type="application/x-amz-json-1.0")
+
         logger.info("→ %s %s", svc, path or "/")
         start = time.time()
-        resp = handler.handle(request, path)
+
+        # Acquire per-service lock so concurrent requests don't corrupt state
+        lock = _locks.get(svc)
+        if lock:
+            with lock:
+                resp = handler.handle(request, path)
+        else:
+            resp = handler.handle(request, path)
+
         duration_ms = int((time.time() - start) * 1000)
         _request_log.append({
             "timestamp": time.time(),
@@ -293,6 +523,8 @@ _TARGET_MAP = {
     # New boto3 CloudWatch uses JSON protocol with this target prefix
     "GraniteServiceVersion20100801": "cloudwatch",
     "CloudWatch": "cloudwatch",
+    "CertificateManager": "acm",
+    "ACM": "acm",
 }
 
 _PATH_PREFIXES = {
@@ -312,6 +544,7 @@ _PATH_PREFIXES = {
     "_mget": "opensearch",
     "_index_template": "opensearch",
     "_aliases": "opensearch",
+    "2013-04-01": "route53",
 }
 
 _ACTION_SERVICES = {
@@ -323,6 +556,13 @@ _ACTION_SERVICES = {
     "events": ["PutRule","DeleteRule","ListRules","PutTargets","RemoveTargets","PutEvents","DescribeRule"],
     "opensearch": ["CreateDomain","DeleteDomain","DescribeDomain","DescribeDomains","ListDomainNames","AddTags","ListTags","RemoveTags","UpdateDomainConfig","GetDomainNames"],
     "cloudwatch": ["PutMetricData","GetMetricStatistics","GetMetricData","ListMetrics","PutMetricAlarm","DescribeAlarms","SetAlarmState","DeleteAlarms","EnableAlarmActions","DisableAlarmActions"],
+    "ses": ["SendEmail","SendRawEmail","VerifyEmailIdentity","VerifyDomainIdentity","ListIdentities","GetSendQuota","GetSendStatistics","DeleteIdentity"],
+    "ec2": ["DescribeInstances","RunInstances","TerminateInstances","StartInstances","StopInstances",
+            "DescribeInstanceStatus","DescribeVpcs","DescribeSubnets","DescribeSecurityGroups",
+            "CreateSecurityGroup","DeleteSecurityGroup","AuthorizeSecurityGroupIngress","AuthorizeSecurityGroupEgress",
+            "DescribeKeyPairs","CreateKeyPair","DeleteKeyPair","DescribeImages","DescribeRegions",
+            "DescribeAvailabilityZones","DescribeVolumes","CreateVolume","DeleteVolume",
+            "DescribeInstanceTypes"],
 }
 
 
@@ -348,6 +588,8 @@ def _detect_service(req, path):
                 "cloudformation": "cloudformation", "rds": "rds",
                 "execute-api": "apigateway", "es": "opensearch", "opensearch": "opensearch",
                 "kinesis": "kinesis", "states": "stepfunctions",
+                "email": "ses", "ses": "ses", "cognito": "cognito",
+                "kms": "kms", "ec2": "ec2", "acm": "acm", "route53": "route53",
             }
             if svc in svc_map:
                 return svc_map[svc]

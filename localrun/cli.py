@@ -52,8 +52,10 @@ def main(ctx):
 @click.option("--services", default=None, help="Comma-separated service list")
 @click.option("--data-dir", default=None, help="Data persistence directory")
 @click.option("--seed", default=None, help="Seed file (JSON) to pre-create resources")
+@click.option("--config", "config_file", default=None, help="YAML config file path")
 @click.option("--debug", is_flag=True, help="Enable debug logging")
-def start(port, host, services, data_dir, seed, debug):
+@click.option("--reload", is_flag=True, help="Auto-reload on config file changes")
+def start(port, host, services, data_dir, seed, config_file, debug, reload):
     """Start the LocalRun server."""
     from localrun.config import LocalRunConfig, set_config
     from localrun.gateway import create_app
@@ -62,6 +64,8 @@ def start(port, host, services, data_dir, seed, debug):
     logging.basicConfig(level=level, format="%(levelname)s %(name)s: %(message)s")
 
     config = LocalRunConfig(host=host, port=port, debug=debug)
+    if config_file:
+        config._load_yaml(config_file)
     if services:
         for s in ALL_SERVICES:
             config.enabled_services[s] = False
@@ -82,7 +86,49 @@ def start(port, host, services, data_dir, seed, debug):
     if seed:
         _load_seed_file(seed, app.config.get("engines", {}))
 
-    app.run(host=host, port=port, debug=debug, use_reloader=False)
+    # Graceful shutdown: save state on SIGINT/SIGTERM
+    import signal
+    def _shutdown(signum, frame):
+        click.echo("\n  Shutting down...")
+        if config.data_dir:
+            from localrun.state import StateManager
+            sm = StateManager(config.data_dir)
+            sm.save_state(app.config.get("engines", {}))
+            click.echo("  State saved.")
+        raise SystemExit(0)
+    signal.signal(signal.SIGINT, _shutdown)
+    signal.signal(signal.SIGTERM, _shutdown)
+
+    # Load plugins from LOCALRUN_PLUGINS dir if set
+    import os
+    plugin_dir = os.environ.get("LOCALRUN_PLUGINS")
+    if plugin_dir and os.path.isdir(plugin_dir):
+        _load_plugins(plugin_dir, app)
+
+    app.run(host=host, port=port, debug=debug, use_reloader=reload)
+
+
+def _load_plugins(plugin_dir, app):
+    """Load Python plugin files from a directory.
+    
+    Each plugin can define a register(app, engines) function.
+    """
+    import importlib.util
+    import os
+    engines = app.config.get("engines", {})
+    for filename in sorted(os.listdir(plugin_dir)):
+        if not filename.endswith(".py"):
+            continue
+        filepath = os.path.join(plugin_dir, filename)
+        try:
+            spec = importlib.util.spec_from_file_location(filename[:-3], filepath)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            if hasattr(mod, "register"):
+                mod.register(app, engines)
+            click.echo(f"  Plugin loaded: {filename}")
+        except Exception as e:
+            click.echo(f"  Plugin error: {filename}: {e}")
 
 
 def _load_seed_file(seed_path, engines):
@@ -207,26 +253,32 @@ def services():
     """List all supported AWS services."""
     click.echo(LOGO)
     click.echo(f"  \033[90mAWS Local Emulator  v{__version__}\033[0m\n")
-    click.echo("  \033[1mSupported Services (18):\033[0m\n")
+    click.echo("  \033[1mSupported Services (24):\033[0m\n")
     all_svc = [
-        ("s3",             "Buckets, objects, range, pagination, multipart upload"),
-        ("sqs",            "Queues, messages, batch ops, purge, visibility"),
-        ("dynamodb",       "Tables, items, query, scan, transactions"),
-        ("sns",            "Topics, subscriptions, publish, SQS delivery"),
-        ("lambda",         "Functions, invoke via subprocess, async invoke"),
-        ("iam",            "Roles, policies, users (stub)"),
+        ("s3",             "Buckets, objects, versioning, ACLs, lifecycle, event notifications"),
+        ("sqs",            "Queues, messages, FIFO, DLQ, batch ops, long polling"),
+        ("dynamodb",       "Tables, items, GSI/LSI, expressions, streams, TTL"),
+        ("sns",            "Topics, subscriptions, publish, SQS/Lambda delivery"),
+        ("lambda",         "Functions, Python/Node.js/Go, layers, async invoke, CloudWatch Logs"),
+        ("iam",            "Roles, policies, users, groups, inline policies, instance profiles"),
         ("logs",           "Log groups, streams, events, metric filters, tags"),
         ("sts",            "GetCallerIdentity, AssumeRole, GetSessionToken"),
         ("secretsmanager", "Secrets CRUD, versioning, tags"),
         ("ssm",            "Parameters CRUD, get-by-path, tags"),
-        ("events",         "Rules, targets, event buses, SQS/SNS routing"),
-        ("cloudformation", "Stacks CRUD, templates (stub)"),
+        ("events",         "Rules, targets, event buses, SQS/SNS/Lambda routing"),
+        ("cloudformation", "Stacks CRUD, templates, resource provisioning"),
         ("rds",            "DB instances, clusters (stub)"),
         ("apigateway",     "REST APIs, resources, methods, integrations, stages"),
         ("opensearch",     "Domains, indices, search, bulk, aggregations"),
-        ("kinesis",        "Streams, shards, put/get records, iterators"),
-        ("cloudwatch",     "Metrics, statistics, alarms, set alarm state"),
+        ("kinesis",        "Streams, shards, put/get records, shard iterators"),
+        ("cloudwatch",     "Metrics, statistics, alarms, SNS triggering"),
         ("stepfunctions",  "State machines, executions (auto-succeed), tags"),
+        ("ses",            "SendEmail, SendRawEmail, identities, local inbox"),
+        ("cognito",        "User pools, sign-up, sign-in, tokens"),
+        ("kms",            "Keys, aliases, encrypt/decrypt, data key generation"),
+        ("ec2",            "Instances, VPCs, subnets, security groups, key pairs, volumes"),
+        ("acm",            "Certificate management, tags"),
+        ("route53",        "Hosted zones, record sets"),
     ]
     for name, desc in all_svc:
         click.echo(f"    \033[32m•\033[0m {name:<18} \033[90m{desc}\033[0m")
@@ -296,3 +348,86 @@ def fault_clear(port, fault_id):
         click.echo(f"\033[32m✔\033[0m {r.json().get('message')}")
     except Exception as e:
         click.echo(f"\033[31m✖\033[0m Could not connect: {e}")
+
+
+@main.command()
+@click.option("--port", default=4566)
+@click.option("--output", default=None, help="Output file (default: stdout)")
+@click.option("--service", default=None, help="Export only a specific service")
+def export(port, output, service):
+    """Export current state as a CloudFormation-compatible JSON template."""
+    try:
+        url = f"http://localhost:{port}/_localrun/resources"
+        if service:
+            url += f"?service={service}"
+        r = requests.get(url, timeout=5)
+        resources = r.json().get("resources", [])
+    except Exception as e:
+        click.echo(f"\033[31m✖\033[0m Could not connect: {e}")
+        raise SystemExit(1)
+
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Description": "LocalRun state export",
+        "Resources": {}
+    }
+
+    for res in resources:
+        svc = res.get("service", "")
+        name = res.get("name", "")
+        logical_id = "".join(c for c in name if c.isalnum())[:64] or "Resource"
+        if svc == "s3":
+            template["Resources"][logical_id + "Bucket"] = {
+                "Type": "AWS::S3::Bucket",
+                "Properties": {"BucketName": name}
+            }
+        elif svc == "sqs":
+            template["Resources"][logical_id + "Queue"] = {
+                "Type": "AWS::SQS::Queue",
+                "Properties": {"QueueName": name}
+            }
+        elif svc == "dynamodb":
+            template["Resources"][logical_id + "Table"] = {
+                "Type": "AWS::DynamoDB::Table",
+                "Properties": {"TableName": name, "BillingMode": "PAY_PER_REQUEST",
+                               "AttributeDefinitions": [{"AttributeName": "id", "AttributeType": "S"}],
+                               "KeySchema": [{"AttributeName": "id", "KeyType": "HASH"}]}
+            }
+        elif svc == "sns":
+            template["Resources"][logical_id + "Topic"] = {
+                "Type": "AWS::SNS::Topic",
+                "Properties": {"TopicName": name}
+            }
+
+    out = json.dumps(template, indent=2)
+    if output:
+        with open(output, "w") as f:
+            f.write(out)
+        click.echo(f"\033[32m✔\033[0m Template written to {output}")
+    else:
+        click.echo(out)
+
+
+@main.command()
+@click.option("--port", default=4566)
+@click.option("--service", default=None, help="Filter by service name")
+@click.option("--limit", default=20, help="Max results")
+def resources(port, service, limit):
+    """List all resources currently in LocalRun."""
+    try:
+        url = f"http://localhost:{port}/_localrun/resources"
+        if service:
+            url += f"?service={service}"
+        r = requests.get(url, timeout=5)
+        data = r.json()
+    except Exception as e:
+        click.echo(f"\033[31m✖\033[0m Could not connect: {e}")
+        raise SystemExit(1)
+    res_list = data.get("resources", [])[:limit]
+    if not res_list:
+        click.echo("No resources found.")
+        return
+    click.echo(f"  {'SERVICE':<16} {'TYPE':<20} {'NAME'}")
+    click.echo(f"  {'-------':<16} {'----':<20} {'----'}")
+    for res in res_list:
+        click.echo(f"  {res.get('service',''):<16} {res.get('type',''):<20} {res.get('name','')}")

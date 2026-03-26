@@ -83,3 +83,33 @@ class TestIAMExtended:
         users = iam_client.list_users()["Users"]
         names = [u["UserName"] for u in users]
         assert "user-list-one" in names
+
+    def test_inline_role_policy(self, iam_client):
+        iam_client.create_role(RoleName="inline-role", AssumeRolePolicyDocument=ASSUME_DOC)
+        iam_client.put_role_policy(RoleName="inline-role", PolicyName="inline-pol", PolicyDocument=POLICY_DOC)
+        r = iam_client.list_role_policies(RoleName="inline-role")
+        assert "inline-pol" in r["PolicyNames"]
+        r2 = iam_client.get_role_policy(RoleName="inline-role", PolicyName="inline-pol")
+        assert r2["PolicyName"] == "inline-pol"
+        iam_client.delete_role_policy(RoleName="inline-role", PolicyName="inline-pol")
+        r3 = iam_client.list_role_policies(RoleName="inline-role")
+        assert "inline-pol" not in r3["PolicyNames"]
+
+    def test_instance_profile(self, iam_client):
+        iam_client.create_instance_profile(InstanceProfileName="test-ip")
+        r = iam_client.get_instance_profile(InstanceProfileName="test-ip")
+        assert r["InstanceProfile"]["InstanceProfileName"] == "test-ip"
+        profiles = iam_client.list_instance_profiles()["InstanceProfiles"]
+        assert any(p["InstanceProfileName"] == "test-ip" for p in profiles)
+        iam_client.delete_instance_profile(InstanceProfileName="test-ip")
+
+    def test_access_keys(self, iam_client):
+        iam_client.create_user(UserName="ak-user")
+        r = iam_client.create_access_key(UserName="ak-user")
+        key = r["AccessKey"]
+        assert key["AccessKeyId"].startswith("AKIA")
+        keys = iam_client.list_access_keys(UserName="ak-user")["AccessKeyMetadata"]
+        assert any(k["AccessKeyId"] == key["AccessKeyId"] for k in keys)
+        iam_client.delete_access_key(UserName="ak-user", AccessKeyId=key["AccessKeyId"])
+        keys2 = iam_client.list_access_keys(UserName="ak-user")["AccessKeyMetadata"]
+        assert not any(k["AccessKeyId"] == key["AccessKeyId"] for k in keys2)

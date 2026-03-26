@@ -58,3 +58,11 @@ def kinesis_client(): return _client("kinesis")
 def cloudwatch_client(): return _client("cloudwatch")
 @pytest.fixture
 def stepfunctions_client(): return _client("stepfunctions")
+@pytest.fixture
+def kms_client(): return _client("kms")
+@pytest.fixture
+def ec2_client(): return _client("ec2")
+@pytest.fixture
+def acm_client(): return _client("acm")
+@pytest.fixture
+def route53_client(): return _client("route53")

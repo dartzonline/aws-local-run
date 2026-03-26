@@ -22,7 +22,7 @@ class SecretsManagerService:
             "PutSecretValue": self._put_value, "DeleteSecret": self._delete,
             "ListSecrets": self._list, "DescribeSecret": self._describe,
             "UpdateSecret": self._update, "TagResource": self._tag,
-            "RestoreSecret": self._restore,
+            "RestoreSecret": self._restore, "RotateSecret": self._rotate,
             "UntagResource": self._untag, "ListSecretVersionIds": self._list_versions,
         }
         h = handlers.get(action)
@@ -151,3 +151,33 @@ class SecretsManagerService:
 
     def reset(self):
         self.secrets = {}
+
+    def _rotate(self, body):
+        name = body.get("SecretId", "")
+        s = self._find(name)
+        if not s:
+            return json_error("ResourceNotFoundException", "Secret not found", 404)
+        # Store rotation config
+        if "RotationLambdaARN" in body:
+            s["RotationLambdaARN"] = body["RotationLambdaARN"]
+        if "RotationRules" in body:
+            s["RotationRules"] = body["RotationRules"]
+        # Create a new version to simulate rotation
+        vid = str(uuid.uuid4())
+        # Move AWSCURRENT to AWSPREVIOUS on old versions
+        for v in s["versions"].values():
+            if "AWSCURRENT" in v["stages"]:
+                v["stages"].remove("AWSCURRENT")
+                if "AWSPREVIOUS" not in v["stages"]:
+                    v["stages"].append("AWSPREVIOUS")
+        # Get current value as the rotated value (in real AWS, the Lambda would change it)
+        current_value = ""
+        for v in s["versions"].values():
+            if "AWSPREVIOUS" in v["stages"]:
+                current_value = v.get("value", "")
+                break
+        s["versions"][vid] = {"value": current_value + "_rotated", "stages": ["AWSCURRENT"]}
+        s["LastChangedDate"] = time.time()
+        s["LastRotatedDate"] = time.time()
+        logger.info("Rotated secret: %s (new version: %s)", name, vid)
+        return _resp({"ARN": s["ARN"], "Name": s["Name"], "VersionId": vid})

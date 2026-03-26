@@ -1,0 +1,78 @@
+name: Reusable LocalRun Test
+
+# This workflow can be called from any other repo's workflow to spin up
+# LocalRun and run tests against it.
+#
+# Example usage from another repo:
+#
+#   jobs:
+#     integration-test:
+#       uses: dartzonline/localrun/.github/workflows/reusable-test.yml@main
+#       with:
+#         test-command: "pytest tests/integration/"
+#         python-version: "3.11"
+
+on:
+  workflow_call:
+    inputs:
+      python-version:
+        description: "Python version to use"
+        type: string
+        default: "3.11"
+      test-command:
+        description: "Test command to run while LocalRun is running"
+        type: string
+        default: "pytest tests/ -v"
+      port:
+        description: "Port for LocalRun to listen on"
+        type: number
+        default: 4566
+      services:
+        description: "Comma-separated list of services to enable (empty = all)"
+        type: string
+        default: ""
+
+jobs:
+  run-with-localrun:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout calling repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Install LocalRun
+        run: pip install aws-local-run
+
+      - name: Install test dependencies
+        run: |
+          if [ -f requirements-test.txt ]; then pip install -r requirements-test.txt; fi
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Start LocalRun in background
+        run: |
+          ARGS="--port ${{ inputs.port }} --host 127.0.0.1"
+          if [ -n "${{ inputs.services }}" ]; then
+            ARGS="$ARGS --services ${{ inputs.services }}"
+          fi
+          aws-local-run start $ARGS &
+          echo "LOCALRUN_PID=$!" >> $GITHUB_ENV
+
+      - name: Wait for LocalRun to be ready
+        run: aws-local-run wait --port ${{ inputs.port }} --timeout 30
+
+      - name: Run tests
+        env:
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+          AWS_DEFAULT_REGION: us-east-1
+          LOCALRUN_PORT: ${{ inputs.port }}
+        run: ${{ inputs.test-command }}
+
+      - name: Stop LocalRun
+        if: always()
+        run: |
+          if [ -n "$LOCALRUN_PID" ]; then kill $LOCALRUN_PID || true; fi

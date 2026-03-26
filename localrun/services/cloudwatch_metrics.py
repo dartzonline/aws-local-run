@@ -41,6 +41,8 @@ class CloudWatchService:
         self.metrics = {}
         # alarms: alarm_name -> alarm dict
         self.alarms = {}
+        # injected by gateway
+        self.sns = None
 
     def handle(self, req, path):
         # New boto3 sends X-Amz-Target with JSON; old protocol uses form-encoded body
@@ -105,6 +107,7 @@ class CloudWatchService:
                 if key not in self.metrics:
                     self.metrics[key] = []
                 self.metrics[key].append({"Timestamp": ts, "Value": value, "Unit": unit})
+            self._evaluate_alarms(namespace)
             logger.info("PutMetricData namespace=%s (%d points)", namespace, len(body.get("MetricData", [])))
             return _json_resp({})
         # Form-encoded (old protocol)
@@ -121,6 +124,8 @@ class CloudWatchService:
                 self.metrics[key] = []
             self.metrics[key].append({"Timestamp": ts, "Value": value, "Unit": unit})
             i += 1
+        namespace = p.get("Namespace", "")
+        self._evaluate_alarms(namespace)
         logger.info("PutMetricData namespace=%s (%d points)", namespace, i - 1)
         return _ok_xml("PutMetricData")
 
@@ -201,8 +206,28 @@ class CloudWatchService:
             body = self._json(req)
             results = []
             for q in body.get("MetricDataQueries", []):
-                results.append({"Id": q.get("Id", ""), "StatusCode": "Complete",
-                                "Timestamps": [], "Values": []})
+                qid = q.get("Id", "")
+                metric_stat = q.get("MetricStat")
+                expression = q.get("Expression", "")
+                timestamps = []
+                values = []
+                if metric_stat:
+                    metric = metric_stat.get("Metric", {})
+                    ns = metric.get("Namespace", "")
+                    mn = metric.get("MetricName", "")
+                    stat = metric_stat.get("Stat", "Average")
+                    points = self.metrics.get((ns, mn), [])
+                    if points:
+                        vals = [pt["Value"] for pt in points]
+                        computed = self._compute_stat(vals, stat)
+                        timestamps = [points[-1]["Timestamp"]]
+                        values = [computed]
+                elif expression:
+                    # basic math: reference other query IDs
+                    values = self._eval_math(expression, body.get("MetricDataQueries", []))
+                    timestamps = [time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())] * len(values)
+                results.append({"Id": qid, "StatusCode": "Complete",
+                                "Timestamps": timestamps, "Values": values})
             return _json_resp({"MetricDataResults": results})
         p = self._p(req)
         # Form-encoded: simplified, just return empty results
@@ -278,6 +303,9 @@ class CloudWatchService:
             "AlarmDescription": p.get("AlarmDescription", ""),
             "StateValue": "INSUFFICIENT_DATA",
             "ActionsEnabled": actions_enabled,
+            "AlarmActions": p.get("AlarmActions", []),
+            "OKActions": p.get("OKActions", []),
+            "InsufficientDataActions": p.get("InsufficientDataActions", []),
         }
         logger.info("Created alarm: %s", name)
         if self._is_json(req):
@@ -388,3 +416,107 @@ class CloudWatchService:
     def reset(self):
         self.metrics = {}
         self.alarms = {}
+
+    def _evaluate_alarms(self, namespace):
+        """Check alarms for the given namespace and trigger state changes."""
+        for alarm in self.alarms.values():
+            if alarm["Namespace"] != namespace:
+                continue
+            key = (alarm["Namespace"], alarm["MetricName"])
+            points = self.metrics.get(key, [])
+            if not points:
+                continue
+            vals = [pt["Value"] for pt in points[-alarm["EvaluationPeriods"]*10:]]
+            if not vals:
+                continue
+            stat_val = self._compute_stat(vals, alarm.get("Statistic", "Average"))
+            threshold = alarm["Threshold"]
+            op = alarm["ComparisonOperator"]
+            in_alarm = False
+            if op == "GreaterThanThreshold" and stat_val > threshold:
+                in_alarm = True
+            elif op == "LessThanThreshold" and stat_val < threshold:
+                in_alarm = True
+            elif op == "GreaterThanOrEqualToThreshold" and stat_val >= threshold:
+                in_alarm = True
+            elif op == "LessThanOrEqualToThreshold" and stat_val <= threshold:
+                in_alarm = True
+            old_state = alarm["StateValue"]
+            new_state = "ALARM" if in_alarm else "OK"
+            if new_state != old_state:
+                alarm["StateValue"] = new_state
+                logger.info("Alarm %s changed to %s (value=%.2f threshold=%.2f)",
+                            alarm["AlarmName"], new_state, stat_val, threshold)
+                if alarm.get("ActionsEnabled") and new_state == "ALARM":
+                    self._fire_alarm_actions(alarm)
+
+    def _fire_alarm_actions(self, alarm):
+        """Send SNS notifications for alarm actions."""
+        if not self.sns:
+            return
+        for action_arn in alarm.get("AlarmActions", []):
+            if ":sns:" in action_arn:
+                topic = self.sns.topics.get(action_arn)
+                if topic:
+                    msg = json.dumps({
+                        "AlarmName": alarm["AlarmName"],
+                        "NewStateValue": alarm["StateValue"],
+                        "MetricName": alarm["MetricName"],
+                        "Namespace": alarm["Namespace"],
+                        "Threshold": alarm["Threshold"],
+                    })
+                    import uuid as _uuid
+                    msg_id = str(_uuid.uuid4())
+                    for sub in topic.subscriptions:
+                        if sub.protocol == "sqs" and self.sns.sqs:
+                            self.sns._deliver_to_sqs(action_arn, sub.endpoint, msg, msg_id, "ALARM: " + alarm["AlarmName"])
+                        elif sub.protocol == "lambda" and self.sns.lambda_svc:
+                            self.sns._deliver_to_lambda(action_arn, sub.endpoint, msg, msg_id, "ALARM: " + alarm["AlarmName"])
+                    logger.info("Alarm action fired to SNS: %s", action_arn)
+
+    def _compute_stat(self, values, stat):
+        if not values:
+            return 0.0
+        stat = stat.lower() if stat else "average"
+        if stat == "sum":
+            return sum(values)
+        if stat == "minimum":
+            return min(values)
+        if stat == "maximum":
+            return max(values)
+        if stat == "samplecount":
+            return float(len(values))
+        # default: average
+        return sum(values) / len(values)
+
+    def _eval_math(self, expression, queries):
+        """Very basic math expression support — handles SUM(m1), AVG(m1), etc."""
+        import re
+        # Build a map of query IDs to their values
+        id_vals = {}
+        for q in queries:
+            metric_stat = q.get("MetricStat")
+            if metric_stat:
+                metric = metric_stat.get("Metric", {})
+                ns = metric.get("Namespace", "")
+                mn = metric.get("MetricName", "")
+                points = self.metrics.get((ns, mn), [])
+                id_vals[q["Id"]] = [pt["Value"] for pt in points]
+
+        # Match patterns like SUM(m1), AVG(m1), MIN(m1), MAX(m1)
+        m = re.match(r'(SUM|AVG|MIN|MAX|AVERAGE)\(([^)]+)\)', expression, re.IGNORECASE)
+        if m:
+            func = m.group(1).upper()
+            ref = m.group(2).strip()
+            vals = id_vals.get(ref, [])
+            if not vals:
+                return [0.0]
+            if func == "SUM":
+                return [sum(vals)]
+            if func in ("AVG", "AVERAGE"):
+                return [sum(vals) / len(vals)]
+            if func == "MIN":
+                return [min(vals)]
+            if func == "MAX":
+                return [max(vals)]
+        return [0.0]

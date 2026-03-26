@@ -18,6 +18,7 @@ class EventBridgeService:
         # injected by gateway after all engines are built
         self.sqs = None
         self.sns = None
+        self.lambda_svc = None
 
     def handle(self, req: Request, path: str) -> Response:
         target = req.headers.get("X-Amz-Target", "")
@@ -112,6 +113,7 @@ class EventBridgeService:
 
         AWS uses subset-matching: every key in the pattern must appear in the event
         with a matching value. Pattern values can be a list of allowed values.
+        Supports nested matching (e.g. {"detail": {"type": ["order"]}}).
         """
         if not pattern_str:
             return False
@@ -119,10 +121,19 @@ class EventBridgeService:
             pattern = json.loads(pattern_str)
         except Exception:
             return False
+        return self._deep_match(pattern, event)
+
+    def _deep_match(self, pattern, data):
+        """Recursively check that every key in pattern matches in data."""
+        if not isinstance(pattern, dict) or not isinstance(data, dict):
+            return False
         for key, expected in pattern.items():
-            actual = event.get(key)
-            if isinstance(expected, list):
-                # Any value in the list is a match
+            actual = data.get(key)
+            if isinstance(expected, dict):
+                # nested match (e.g. pattern={"detail": {"status": ["completed"]}})
+                if not self._deep_match(expected, actual if isinstance(actual, dict) else {}):
+                    return False
+            elif isinstance(expected, list):
                 if actual not in expected:
                     return False
             else:
@@ -158,20 +169,40 @@ class EventBridgeService:
         elif ":sns:" in arn and self.sns:
             topic = self.sns.topics.get(arn)
             if topic:
-                import uuid as _uuid
-                msg_id = str(_uuid.uuid4())
+                msg_id = str(uuid.uuid4())
                 logger.info("EventBridge routed to SNS topic: %s", arn)
-                # Fanout via SNS
-                from localrun.utils import iso_timestamp
                 subject = event.get("detail-type", "EventBridgeEvent")
-                self.sns._deliver_to_sqs and None  # SNS handles its own fanout
                 for sub in topic.subscriptions:
                     if sub.protocol == "sqs" and self.sqs:
                         self.sns._deliver_to_sqs(arn, sub.endpoint, event_body, msg_id, subject)
+                    elif sub.protocol == "lambda" and self.sns.lambda_svc:
+                        self.sns._deliver_to_lambda(arn, sub.endpoint, event_body, msg_id, subject)
             else:
                 logger.warning("EventBridge: SNS topic not found: %s", arn)
+        elif ":lambda:" in arn or ":function:" in arn:
+            self._dispatch_to_lambda(arn, event_body)
         else:
             logger.debug("EventBridge: no handler for target ARN: %s", arn)
+
+    def _dispatch_to_lambda(self, fn_arn, event_body):
+        if not self.lambda_svc:
+            logger.warning("EventBridge: Lambda not wired, cannot invoke %s", fn_arn)
+            return
+        fn_name = fn_arn.split(":")[-1]
+        # strip qualifier if present (e.g. function:myFunc:$LATEST)
+        if fn_name.startswith("$") or fn_name.isdigit():
+            parts = fn_arn.split(":")
+            fn_name = parts[-2] if len(parts) > 1 else fn_name
+        fn = self.lambda_svc.functions.get(fn_name)
+        if not fn:
+            logger.warning("EventBridge: Lambda function not found: %s", fn_name)
+            return
+        import threading
+        t = threading.Thread(
+            target=self.lambda_svc._execute_function, args=(fn, event_body), daemon=True
+        )
+        t.start()
+        logger.info("EventBridge routed to Lambda: %s", fn_name)
 
     def _create_bus(self, body):
         name = body.get("Name", "")

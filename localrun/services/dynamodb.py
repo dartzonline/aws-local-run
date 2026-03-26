@@ -20,6 +20,7 @@ class DynamoDBService:
         self.table_items = {}    # table_name -> list of items
         self.streams = {}        # table_name -> list of stream records
         self.stream_iterators = {}  # iterator_token -> {"table": name, "pos": int}
+        self.ttl_config = {}     # table_name -> {"AttributeName": str, "TimeToLiveStatus": str}
 
     def handle(self, req: Request, path: str) -> Response:
         target = req.headers.get("X-Amz-Target", "")
@@ -41,6 +42,8 @@ class DynamoDBService:
             "GetShardIterator": self._get_shard_iterator,
             "GetRecords": self._get_records,
             "ListStreams": self._list_streams,
+            "UpdateTimeToLive": self._update_ttl,
+            "DescribeTimeToLive": self._describe_ttl,
         }
         handler = actions.get(action)
         if not handler:
@@ -375,10 +378,27 @@ class DynamoDBService:
                 return idx, "LSI"
         return None, None
 
+    def _is_expired(self, table_name, item):
+        """Return True if the item has a TTL attribute that is in the past."""
+        cfg = self.ttl_config.get(table_name, {})
+        if cfg.get("TimeToLiveStatus") != "ENABLED":
+            return False
+        attr = cfg.get("AttributeName", "")
+        if not attr or attr not in item:
+            return False
+        val = item[attr]
+        ttl_val = val.get("N")
+        if ttl_val is None:
+            return False
+        try:
+            return float(ttl_val) < time.time()
+        except (ValueError, TypeError):
+            return False
+
     def _query(self, body):
         name = body.get("TableName", "")
         if name not in self.tables: return _json_err("ResourceNotFoundException", f"Table {name} not found")
-        items = self.table_items.get(name, [])
+        items = [i for i in self.table_items.get(name, []) if not self._is_expired(name, i)]
         expr = body.get("KeyConditionExpression", "")
         values = body.get("ExpressionAttributeValues", {})
         attr_names = body.get("ExpressionAttributeNames", {})
@@ -414,7 +434,7 @@ class DynamoDBService:
     def _scan(self, body):
         name = body.get("TableName", "")
         if name not in self.tables: return _json_err("ResourceNotFoundException", f"Table {name} not found")
-        all_items = list(self.table_items.get(name, []))
+        all_items = [i for i in self.table_items.get(name, []) if not self._is_expired(name, i)]
         scanned = len(all_items)
         filter_expr = body.get("FilterExpression")
         if filter_expr:
@@ -561,8 +581,23 @@ class DynamoDBService:
                 })
         return _json_resp({"Streams": arns})
 
+    def _update_ttl(self, body):
+        name = body.get("TableName", "")
+        spec = body.get("TimeToLiveSpecification", {})
+        attr = spec.get("AttributeName", "")
+        enabled = spec.get("Enabled", False)
+        status = "ENABLED" if enabled else "DISABLED"
+        self.ttl_config[name] = {"AttributeName": attr, "TimeToLiveStatus": status}
+        return _json_resp({"TimeToLiveSpecification": {"AttributeName": attr, "Enabled": enabled, "TimeToLiveStatus": status}})
+
+    def _describe_ttl(self, body):
+        name = body.get("TableName", "")
+        cfg = self.ttl_config.get(name, {"AttributeName": "", "TimeToLiveStatus": "DISABLED"})
+        return _json_resp({"TimeToLiveDescription": cfg})
+
     def reset(self):
         self.tables = {}
         self.table_items = {}
         self.streams = {}
         self.stream_iterators = {}
+        self.ttl_config = {}

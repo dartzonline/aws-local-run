@@ -1,5 +1,5 @@
 """SSM Parameter Store service emulator."""
-import json, logging, time
+import base64, json, logging, time
 from flask import Request, Response
 from localrun.config import get_config
 from localrun.utils import parse_json_body, json_error, new_request_id
@@ -41,21 +41,34 @@ class SSMService:
         if exists and not overwrite:
             return json_error("ParameterAlreadyExists", f"Parameter {name} already exists")
         version = self.parameters[name]["Version"] + 1 if exists else 1
+        param_type = body.get("Type", "String")
+        value = body.get("Value", "")
+        # SecureString: encode the value
+        if param_type == "SecureString":
+            value = base64.b64encode(value.encode()).decode()
         self.parameters[name] = {
-            "Name": name, "Type": body.get("Type", "String"),
-            "Value": body.get("Value", ""), "Version": version,
+            "Name": name, "Type": param_type,
+            "Value": value, "Version": version,
             "LastModifiedDate": time.time(), "ARN": self._arn(name),
             "Description": body.get("Description", ""),
             "Tags": body.get("Tags", []),
         }
-        logger.info("Put parameter: %s (v%d)", name, version)
+        logger.info("Put parameter: %s (v%d, type=%s)", name, version, param_type)
         return _resp({"Version": version})
 
     def _get(self, body):
         name = body.get("Name", "")
         p = self.parameters.get(name)
         if not p: return json_error("ParameterNotFound", f"Parameter {name} not found", 400)
-        return _resp({"Parameter": {"Name": p["Name"], "Type": p["Type"], "Value": p["Value"],
+        value = p["Value"]
+        # Decrypt SecureString if requested
+        with_decrypt = body.get("WithDecryption", False)
+        if p["Type"] == "SecureString" and with_decrypt:
+            try:
+                value = base64.b64decode(value).decode()
+            except Exception:
+                pass
+        return _resp({"Parameter": {"Name": p["Name"], "Type": p["Type"], "Value": value,
                                      "Version": p["Version"], "LastModifiedDate": p["LastModifiedDate"],
                                      "ARN": p["ARN"]}})
 
