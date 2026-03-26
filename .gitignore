@@ -11,3 +11,4 @@ build/
 *.swo
 data/
 .claude/
+localrun_state*.json

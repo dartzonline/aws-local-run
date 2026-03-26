@@ -1,13 +1,13 @@
 # LocalRun
 
-**Run AWS services locally.** LocalRun is a lightweight, pure-Python AWS service emulator. It runs 18 AWS services on a single port with zero external dependencies — no Docker, no JVM, just `pip install` and go.
+**Run AWS services locally.** LocalRun is a lightweight, pure-Python AWS service emulator. It runs 24 AWS services on a single port with zero external dependencies — no Docker, no JVM, just `pip install` and go.
 
 Built for developers who need fast, offline AWS testing without the overhead of full cloud emulators.
 
 ## Why LocalRun?
 
 - **Zero setup** — `pip install` and run. No Docker required.
-- **Single port** — all 18 services on `:4566`, just like production endpoint routing.
+- **Single port** — all 24 services on `:4566`, just like production endpoint routing.
 - **Drop-in compatible** — works with `boto3`, AWS CLI, and any AWS SDK. Just set `endpoint_url`.
 - **Fast** — starts in under a second. In-memory storage, no cold starts.
 - **Pure Python** — easy to extend, debug, and contribute to.
@@ -17,23 +17,29 @@ Built for developers who need fast, offline AWS testing without the overhead of 
 | Service | Operations |
 |---------|-----------|
 | **S3** | Buckets, objects, copy, multi-delete, list v2, range downloads, multipart upload, pagination |
-| **SQS** | Queues, messages, purge, attributes, batch send/delete/visibility, tags |
-| **DynamoDB** | Tables, items, query, scan, batch ops, update expressions, transactions |
+| **SQS** | Queues, messages, purge, attributes, batch send/delete/visibility, long polling, tags |
+| **DynamoDB** | Tables, items, query, scan, batch ops, update expressions, transactions, TTL |
 | **SNS** | Topics, subscriptions, publish, SNS→SQS fanout delivery |
-| **Lambda** | Functions, invoke (sync + async), aliases, event source mappings, permissions, tags |
-| **IAM** | Roles, policies, users (stub) |
+| **Lambda** | Functions, invoke (sync + async), aliases, event source mappings, permissions, CloudWatch Logs integration |
+| **IAM** | Roles, policies, users, inline policies, instance profiles, groups, access keys |
 | **CloudWatch Logs** | Log groups, streams, events, retention, tags, metric filters |
 | **CloudWatch Metrics** | Put/get metrics, alarms, list metrics, set alarm state |
 | **STS** | GetCallerIdentity, AssumeRole, GetSessionToken |
-| **Secrets Manager** | Secrets CRUD, versioning, tags |
+| **Secrets Manager** | Secrets CRUD, versioning, rotation, tags |
 | **SSM Parameter Store** | Parameters CRUD, get-by-path, versioning, tags |
-| **EventBridge** | Rules, targets, events, event buses, SQS/SNS routing |
+| **EventBridge** | Rules, targets, events, event buses, SQS/SNS/Lambda routing |
 | **CloudFormation** | Stacks CRUD, describe, templates (stub) |
 | **RDS** | DB instances, clusters CRUD (stub) |
-| **API Gateway** | REST APIs, resources, deployments, stages, methods, integrations |
+| **API Gateway** | REST APIs, resources, methods, integrations, deployments, stages, Lambda proxy |
 | **OpenSearch** | Domains (control-plane), indices, documents, search, bulk, aggregations |
 | **Kinesis** | Streams, shards, put/get records, shard iterators, list shards |
 | **Step Functions** | State machines, executions, history, tags |
+| **KMS** | Keys, aliases, encrypt/decrypt, GenerateDataKey, key policies, tags |
+| **EC2** | Instances, VPCs, subnets, security groups, key pairs, volumes, AMIs |
+| **ACM** | Certificates (request, describe, list, delete), tags |
+| **Route53** | Hosted zones, record sets (A, CNAME, MX, etc.) |
+| **SES** | Send email, verify identities, send quota, inbox inspection |
+| **Cognito** | User pools, pool clients, users, sign-up, auth flows |
 
 ## Quick Start
 
@@ -98,8 +104,6 @@ aws --endpoint-url http://localhost:4566 sts get-caller-identity
 
 ### Example: Flask App with S3 + SQS
 
-Here's a real-world example — a Flask app that uploads files to S3 and sends job messages to SQS, running entirely against LocalRun:
-
 ```python
 import boto3, os
 
@@ -128,8 +132,6 @@ for msg in messages.get("Messages", []):
 ```
 
 ### Example: pytest Integration
-
-Use LocalRun in your test suite with a simple fixture:
 
 ```python
 # conftest.py
@@ -174,6 +176,9 @@ aws-local-run start --debug              # Debug logging
 aws-local-run start --seed seed.json     # Pre-create resources from file
 aws-local-run status                     # Check if running
 aws-local-run services                   # List all services
+aws-local-run resources                  # List all created resources
+aws-local-run resources --service s3     # Filter by service
+aws-local-run export                     # Export state as CloudFormation JSON
 aws-local-run wait                       # Wait until server is ready
 aws-local-run wait --timeout 60          # Custom timeout (seconds)
 aws-local-run fault list                 # List active fault injections
@@ -324,6 +329,21 @@ curl -X POST "http://localhost:4566/_localrun/reset?service=sqs"
 
 Useful for test isolation.
 
+## Resource Listing
+
+List all resources currently created across services:
+
+```bash
+# All resources
+curl http://localhost:4566/_localrun/resources
+
+# Or via CLI
+aws-local-run resources
+aws-local-run resources --service s3
+```
+
+Returns a flat list of resource objects with `service`, `type`, `name`, and `id` fields.
+
 ## SNS → SQS Delivery
 
 When you subscribe an SQS queue to an SNS topic, messages published to the topic are delivered to the queue automatically:
@@ -367,21 +387,155 @@ events.put_events(Entries=[{
 # The event arrives in the SQS queue
 ```
 
-## Kinesis
+## SQS Long Polling
+
+SQS supports long polling — wait for a message to arrive instead of immediately returning empty:
 
 ```python
-kinesis = boto3.client("kinesis", endpoint_url="http://localhost:4566", ...)
+# Wait up to 20 seconds for a message
+resp = sqs.receive_message(
+    QueueUrl=queue_url,
+    WaitTimeSeconds=20,
+    MaxNumberOfMessages=1,
+)
+```
 
-kinesis.create_stream(StreamName="events", ShardCount=2)
-kinesis.put_record(StreamName="events", Data=b"hello", PartitionKey="key1")
+You can also set `ReceiveMessageWaitTimeSeconds` on the queue to enable long polling by default.
 
-iterator = kinesis.get_shard_iterator(
-    StreamName="events",
-    ShardId="shardId-000000000000",
-    ShardIteratorType="TRIM_HORIZON",
-)["ShardIterator"]
+## DynamoDB TTL
 
-records = kinesis.get_records(ShardIterator=iterator)["Records"]
+DynamoDB TTL automatically filters out expired items in scan and query operations:
+
+```python
+# Enable TTL on a table
+dynamodb.update_time_to_live(
+    TableName="sessions",
+    TimeToLiveSpecification={"Enabled": True, "AttributeName": "expires_at"},
+)
+
+# Items with expires_at < now() are automatically excluded from reads
+dynamodb.put_item(
+    TableName="sessions",
+    Item={"id": {"S": "abc"}, "expires_at": {"N": str(int(time.time()) - 3600)}},  # already expired
+)
+scan = dynamodb.scan(TableName="sessions")
+# The expired item is not returned
+```
+
+## DynamoDB Transactions
+
+```python
+dynamodb = boto3.client("dynamodb", endpoint_url="http://localhost:4566", ...)
+
+dynamodb.transact_write_items(TransactItems=[
+    {"Put": {"TableName": "orders", "Item": {"id": {"S": "1"}, "status": {"S": "new"}}}},
+    {"Put": {"TableName": "orders", "Item": {"id": {"S": "2"}, "status": {"S": "new"}}}},
+])
+
+result = dynamodb.transact_get_items(TransactItems=[
+    {"Get": {"TableName": "orders", "Key": {"id": {"S": "1"}}}},
+])
+```
+
+## KMS Encryption
+
+```python
+kms = boto3.client("kms", endpoint_url="http://localhost:4566", ...)
+
+# Create a key
+key_id = kms.create_key(Description="my-key")["KeyMetadata"]["KeyId"]
+kms.create_alias(AliasName="alias/my-key", TargetKeyId=key_id)
+
+# Encrypt and decrypt
+ciphertext = kms.encrypt(
+    KeyId="alias/my-key",
+    Plaintext=b"hello world",
+)["CiphertextBlob"]
+
+plaintext = kms.decrypt(CiphertextBlob=ciphertext)["Plaintext"]
+assert plaintext == b"hello world"
+
+# Generate a data key (for envelope encryption)
+dk = kms.generate_data_key(KeyId=key_id, KeySpec="AES_256")
+# Use dk["Plaintext"] to encrypt data locally
+# Store dk["CiphertextBlob"] alongside your encrypted data
+```
+
+## Lambda → CloudWatch Logs
+
+Lambda invocations automatically write to CloudWatch Logs at `/aws/lambda/{function_name}`:
+
+```python
+lam = boto3.client("lambda", endpoint_url="http://localhost:4566", ...)
+logs = boto3.client("logs", endpoint_url="http://localhost:4566", ...)
+
+lam.invoke(FunctionName="my-function", Payload=b"{}")
+
+# Check the logs
+streams = logs.describe_log_streams(logGroupName="/aws/lambda/my-function")["logStreams"]
+events = logs.get_log_events(
+    logGroupName="/aws/lambda/my-function",
+    logStreamName=streams[0]["logStreamName"],
+)["events"]
+```
+
+## EC2
+
+```python
+ec2 = boto3.client("ec2", endpoint_url="http://localhost:4566", ...)
+
+# Instances
+reservation = ec2.run_instances(
+    ImageId="ami-12345678",
+    InstanceType="t2.micro",
+    MinCount=1,
+    MaxCount=1,
+)
+instance_id = reservation["Instances"][0]["InstanceId"]
+
+# Security groups
+sg = ec2.create_security_group(
+    GroupName="my-sg", Description="My security group"
+)["GroupId"]
+
+ec2.authorize_security_group_ingress(
+    GroupId=sg,
+    IpPermissions=[{"IpProtocol": "tcp", "FromPort": 80, "ToPort": 80,
+                    "IpRanges": [{"CidrIp": "0.0.0.0/0"}]}],
+)
+
+# Volumes
+volume = ec2.create_volume(
+    AvailabilityZone="us-east-1a",
+    Size=20,
+    VolumeType="gp2",
+)["VolumeId"]
+```
+
+## IAM
+
+```python
+iam = boto3.client("iam", endpoint_url="http://localhost:4566", ...)
+
+# Roles
+role = iam.create_role(
+    RoleName="my-role",
+    AssumeRolePolicyDocument='{"Version":"2012-10-17","Statement":[]}',
+)["Role"]["RoleArn"]
+
+# Inline policies
+iam.put_role_policy(
+    RoleName="my-role",
+    PolicyName="s3-read",
+    PolicyDocument='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"*"}]}',
+)
+
+# Instance profiles
+iam.create_instance_profile(InstanceProfileName="my-profile")
+iam.add_role_to_instance_profile(InstanceProfileName="my-profile", RoleName="my-role")
+
+# Access keys
+keys = iam.create_access_key(UserName="my-user")["AccessKey"]
 ```
 
 ## Step Functions
@@ -404,6 +558,102 @@ execution = sfn.start_execution(
 
 desc = sfn.describe_execution(executionArn=execution)
 print(desc["status"])  # SUCCEEDED
+```
+
+## Kinesis
+
+```python
+kinesis = boto3.client("kinesis", endpoint_url="http://localhost:4566", ...)
+
+kinesis.create_stream(StreamName="events", ShardCount=2)
+kinesis.put_record(StreamName="events", Data=b"hello", PartitionKey="key1")
+
+iterator = kinesis.get_shard_iterator(
+    StreamName="events",
+    ShardId="shardId-000000000000",
+    ShardIteratorType="TRIM_HORIZON",
+)["ShardIterator"]
+
+records = kinesis.get_records(ShardIterator=iterator)["Records"]
+```
+
+## Route53
+
+```python
+r53 = boto3.client("route53", endpoint_url="http://localhost:4566", ...)
+
+zone = r53.create_hosted_zone(Name="example.com", CallerReference="ref1")
+zone_id = zone["HostedZone"]["Id"].split("/")[-1]
+
+r53.change_resource_record_sets(
+    HostedZoneId=zone_id,
+    ChangeBatch={
+        "Changes": [{
+            "Action": "CREATE",
+            "ResourceRecordSet": {
+                "Name": "api.example.com",
+                "Type": "A",
+                "TTL": 300,
+                "ResourceRecords": [{"Value": "1.2.3.4"}],
+            },
+        }]
+    },
+)
+
+records = r53.list_resource_record_sets(HostedZoneId=zone_id)["ResourceRecordSets"]
+```
+
+## SES
+
+```python
+ses = boto3.client("ses", endpoint_url="http://localhost:4566", ...)
+
+# Verify sender
+ses.verify_email_identity(EmailAddress="sender@example.com")
+
+# Send email
+ses.send_email(
+    Source="sender@example.com",
+    Destination={"ToAddresses": ["recipient@example.com"]},
+    Message={
+        "Subject": {"Data": "Hello"},
+        "Body": {"Text": {"Data": "This is the body"}},
+    },
+)
+
+# Inspect sent emails (LocalRun only)
+import requests, json
+inbox = requests.get("http://localhost:4566/_localrun/ses/inbox").json()["emails"]
+print(inbox[-1]["Subject"])  # "Hello"
+```
+
+## Cognito
+
+```python
+cognito = boto3.client("cognito-idp", endpoint_url="http://localhost:4566", ...)
+
+pool = cognito.create_user_pool(PoolName="my-pool")["UserPool"]
+pool_id = pool["Id"]
+
+client = cognito.create_user_pool_client(
+    UserPoolId=pool_id,
+    ClientName="my-app",
+)["UserPoolClient"]
+client_id = client["ClientId"]
+
+# Create and authenticate a user
+cognito.admin_create_user(
+    UserPoolId=pool_id,
+    Username="alice@example.com",
+    TemporaryPassword="Temp123!",
+)
+
+resp = cognito.initiate_auth(
+    AuthFlow="USER_PASSWORD_AUTH",
+    AuthParameters={"USERNAME": "alice@example.com", "PASSWORD": "Temp123!"},
+    ClientId=client_id,
+)
+token = resp["AuthenticationResult"]["AccessToken"]
 ```
 
 ## S3 Extras
@@ -433,21 +683,6 @@ s3.complete_multipart_upload(
 )
 ```
 
-## DynamoDB Transactions
-
-```python
-dynamodb = boto3.client("dynamodb", endpoint_url="http://localhost:4566", ...)
-
-dynamodb.transact_write_items(TransactItems=[
-    {"Put": {"TableName": "orders", "Item": {"id": {"S": "1"}, "status": {"S": "new"}}}},
-    {"Put": {"TableName": "orders", "Item": {"id": {"S": "2"}, "status": {"S": "new"}}}},
-])
-
-result = dynamodb.transact_get_items(TransactItems=[
-    {"Get": {"TableName": "orders", "Key": {"id": {"S": "1"}}}},
-])
-```
-
 ## Configuration
 
 | Environment Variable | Default | Description |
@@ -458,6 +693,62 @@ result = dynamodb.transact_get_items(TransactItems=[
 | `LOCALRUN_ACCOUNT_ID` | `000000000000` | Account ID |
 | `LOCALRUN_DATA_DIR` | (none) | State persistence directory |
 | `LOCALRUN_DEBUG` | `false` | Debug logging |
+
+## Internal API Reference
+
+All `/_localrun/` endpoints return JSON.
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/health` | GET | Health check — returns `{"status": "running"}` |
+| `/_localrun/reset` | POST | Reset all services (add `?service=sqs` for one service) |
+| `/_localrun/faults` | GET/POST/DELETE | List, add, or remove fault injections |
+| `/_localrun/requests` | GET | Request log (add `?service=s3&limit=10`) |
+| `/_localrun/resources` | GET | List all resources across services |
+| `/_localrun/state/save` | POST | Save current state to disk |
+| `/_localrun/state/load` | POST | Load state from disk |
+| `/_localrun/state/save/<name>` | POST | Save named snapshot |
+| `/_localrun/state/load/<name>` | POST | Load named snapshot |
+| `/_localrun/state/snapshots` | GET | List available snapshots |
+| `/_localrun/ses/inbox` | GET | Inspect the SES inbox (last 50 emails) |
+
+## JavaScript / Node.js Package
+
+LocalRun includes a TypeScript/Node.js package for Jest and Vitest integration.
+
+```bash
+npm install localrun
+```
+
+### Jest
+
+```js
+// jest.config.js
+const { jestPreset } = require("localrun/jest");
+module.exports = { ...jestPreset };
+```
+
+### Vitest
+
+```ts
+// vitest.config.ts
+import { localrunSetup } from "localrun/vitest";
+export default defineConfig({
+  test: { globalSetup: [localrunSetup()] },
+});
+```
+
+### Programmatic
+
+```ts
+import { startLocalRun, withLocalRun } from "localrun";
+
+// Wrap a test suite
+await withLocalRun(async ({ endpoint }) => {
+  const s3 = new S3Client({ endpoint, region: "us-east-1", ... });
+  // your tests
+});
+```
 
 ## Docker
 
@@ -476,7 +767,7 @@ pip install -e ".[dev]"
 pytest tests/ -v
 ```
 
-266 integration tests across 18 services.
+360 integration tests across 24 services.
 
 ## Project Structure
 
@@ -487,6 +778,7 @@ localrun/
 ├── config.py             # Configuration
 ├── gateway.py            # Request routing
 ├── state.py              # JSON state persistence
+├── faults.py             # Fault injection
 ├── utils.py              # Shared utilities
 └── services/
     ├── s3.py             ├── sts.py
@@ -497,7 +789,10 @@ localrun/
     ├── iam.py            ├── rds.py
     ├── cloudwatch_logs.py├── apigateway.py
     ├── cloudwatch_metrics.py ├── opensearch.py
-    ├── kinesis.py        └── stepfunctions.py
+    ├── kinesis.py        ├── stepfunctions.py
+    ├── kms.py            ├── ec2.py
+    ├── acm.py            ├── route53.py
+    ├── ses.py            └── cognito.py
 ```
 
 ## License

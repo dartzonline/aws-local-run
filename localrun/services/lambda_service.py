@@ -1,5 +1,5 @@
 """Lambda service emulator."""
-import base64, hashlib, json, logging, os, subprocess, sys, tempfile, threading, uuid, zipfile
+import base64, hashlib, json, logging, os, subprocess, sys, tempfile, threading, time, uuid, zipfile
 from dataclasses import dataclass, field
 from flask import Request, Response
 from localrun.config import get_config
@@ -445,15 +445,17 @@ class LambdaService:
             # Ensure log group exists
             if group not in self.logs_svc.log_groups:
                 from localrun.services.cloudwatch_logs import LogGroup
-                self.logs_svc.log_groups[group] = LogGroup(name=group)
+                c = get_config()
+                arn = f"arn:aws:logs:{c.region}:{c.account_id}:log-group:{group}"
+                self.logs_svc.log_groups[group] = LogGroup(name=group, arn=arn)
             lg = self.logs_svc.log_groups[group]
             if stream not in lg.streams:
                 from localrun.services.cloudwatch_logs import LogStream
                 lg.streams[stream] = LogStream(name=stream)
             ls = lg.streams[stream]
             ls.events.append({"timestamp": int(time.time() * 1000), "message": message})
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("_write_to_logs failed: %s", e)
 
     def _invoke(self, req, name):
         fn = self.functions.get(name)

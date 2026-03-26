@@ -18,11 +18,20 @@ class APIGatewayService:
         self.methods = {}      # f"{api_id}/{resource_id}" -> {method: config}
         self.deployments = {}  # api_id -> [deployments]
         self.stages = {}       # api_id -> {name: stage}
+        self.tags = {}         # arn -> {tag: value}
         self.lambda_svc = None  # injected by gateway
 
     def handle(self, req: Request, path: str) -> Response:
         method = req.method
         parts = path.strip("/").split("/")
+
+        # Tag operations: PUT/GET /tags/{arn}
+        if parts[0] == "tags":
+            arn = "/".join(parts[1:]) if len(parts) > 1 else ""
+            if method == "PUT": return self._tag_resource(req, arn)
+            if method == "GET": return self._get_tags(arn)
+            if method == "DELETE": return self._untag_resource(req, arn)
+            return _err("Not found", 404)
 
         if not path.startswith("restapis"):
             return _err("Not found", 404)
@@ -48,6 +57,7 @@ class APIGatewayService:
                 resource_id = parts[3]
                 if len(parts) == 4:
                     if method == "GET": return self._get_resource(api_id, resource_id)
+                    if method == "POST": return self._create_resource(req, api_id, parent_id=resource_id)
                 if len(parts) >= 5 and parts[4] == "methods":
                     if len(parts) == 5:
                         if method == "GET": return self._list_methods(api_id, resource_id)
@@ -112,9 +122,11 @@ class APIGatewayService:
         res = self.resources.get(api_id, {})
         return _resp({"item": list(res.values())})
 
-    def _create_resource(self, req, api_id):
+    def _create_resource(self, req, api_id, parent_id=None):
         body = req.get_json(silent=True) or json.loads(req.get_data(as_text=True) or "{}")
-        parent_id = body.get("parentId")
+        # parent_id from URL takes precedence over body
+        if parent_id is None:
+            parent_id = body.get("parentId")
         path_part = body.get("pathPart", "")
         rid = uuid.uuid4().hex[:10]
         parent = self.resources.get(api_id, {}).get(parent_id, {})
@@ -202,12 +214,29 @@ class APIGatewayService:
             self.methods[key].pop("integration", None)
         return Response("", 204)
 
+    def _tag_resource(self, req, arn):
+        body = req.get_json(silent=True) or json.loads(req.get_data(as_text=True) or "{}")
+        tags = body.get("tags", {})
+        self.tags.setdefault(arn, {}).update(tags)
+        return Response("", 204)
+
+    def _get_tags(self, arn):
+        return _resp({"tags": self.tags.get(arn, {})})
+
+    def _untag_resource(self, req, arn):
+        keys = req.args.getlist("tagKeys")
+        existing = self.tags.get(arn, {})
+        for k in keys:
+            existing.pop(k, None)
+        return Response("", 204)
+
     def reset(self):
         self.apis = {}
         self.resources = {}
         self.methods = {}
         self.deployments = {}
         self.stages = {}
+        self.tags = {}
 
     def _invoke_proxy(self, req, api_id, resource_path, http_method):
         """Find a matching resource and invoke Lambda via AWS_PROXY."""

@@ -57,8 +57,8 @@ class Route53Service:
 
     def handle(self, req: Request, path: str) -> Response:
         method = req.method
-        # strip leading slash
-        p = path.lstrip("/")
+        # strip leading/trailing slashes
+        p = path.strip("/")
         parts = p.split("/")
         # parts[0] = "2013-04-01", parts[1] = "hostedzone", ...
         if len(parts) < 2:
@@ -88,14 +88,20 @@ class Route53Service:
         except ET.ParseError:
             return error_response("MalformedXML", "Bad XML body", 400)
         def _txt(tag):
-            el = root.find(_NS_TAG + tag) or root.find(tag)
+            el = root.find(_NS_TAG + tag)
+            if el is None:
+                el = root.find(tag)
             return el.text if el is not None else ""
         name = _txt("Name")
         caller_ref = _txt("CallerReference")
         comment = ""
-        cfg = root.find(_NS_TAG + "HostedZoneConfig") or root.find("HostedZoneConfig")
+        cfg = root.find(_NS_TAG + "HostedZoneConfig")
+        if cfg is None:
+            cfg = root.find("HostedZoneConfig")
         if cfg is not None:
-            cel = cfg.find(_NS_TAG + "Comment") or cfg.find("Comment")
+            cel = cfg.find(_NS_TAG + "Comment")
+            if cel is None:
+                cel = cfg.find("Comment")
             if cel is not None:
                 comment = cel.text or ""
         if not name:
@@ -145,17 +151,25 @@ class Route53Service:
             root = ET.fromstring(req.get_data(as_text=True))
         except ET.ParseError:
             return error_response("MalformedXML", "Bad XML body", 400)
-        batch = root.find(_NS_TAG + "ChangeBatch") or root.find("ChangeBatch")
+        batch = root.find(_NS_TAG + "ChangeBatch")
+        if batch is None:
+            batch = root.find("ChangeBatch")
         changes = []
         if batch is not None:
-            chg_list = batch.find(_NS_TAG + "Changes") or batch.find("Changes")
+            chg_list = batch.find(_NS_TAG + "Changes")
+            if chg_list is None:
+                chg_list = batch.find("Changes")
             if chg_list is not None:
                 for chg in chg_list:
                     changes.append(chg)
         for chg in changes:
-            act_el = chg.find(_NS_TAG + "Action") or chg.find("Action")
+            act_el = chg.find(_NS_TAG + "Action")
+            if act_el is None:
+                act_el = chg.find("Action")
             action = act_el.text if act_el is not None else ""
-            rrs_el = chg.find(_NS_TAG + "ResourceRecordSet") or chg.find("ResourceRecordSet")
+            rrs_el = chg.find(_NS_TAG + "ResourceRecordSet")
+            if rrs_el is None:
+                rrs_el = chg.find("ResourceRecordSet")
             if rrs_el is None:
                 continue
             rec = self._parse_rrs(rrs_el)
@@ -168,17 +182,23 @@ class Route53Service:
 
     def _parse_rrs(self, rrs_el):
         def _txt(tag):
-            el = rrs_el.find(_NS_TAG + tag) or rrs_el.find(tag)
+            el = rrs_el.find(_NS_TAG + tag)
+            if el is None:
+                el = rrs_el.find(tag)
             return el.text if el is not None else ""
         name = _txt("Name")
         rtype = _txt("Type")
         ttl_raw = _txt("TTL")
         ttl = int(ttl_raw) if ttl_raw.isdigit() else 300
         vals = []
-        rr_list = rrs_el.find(_NS_TAG + "ResourceRecords") or rrs_el.find("ResourceRecords")
+        rr_list = rrs_el.find(_NS_TAG + "ResourceRecords")
+        if rr_list is None:
+            rr_list = rrs_el.find("ResourceRecords")
         if rr_list is not None:
             for rr in rr_list:
-                vel = rr.find(_NS_TAG + "Value") or rr.find("Value")
+                vel = rr.find(_NS_TAG + "Value")
+                if vel is None:
+                    vel = rr.find("Value")
                 if vel is not None:
                     vals.append({"Value": vel.text or ""})
         return {"Name": name, "Type": rtype, "TTL": ttl, "ResourceRecords": vals}
