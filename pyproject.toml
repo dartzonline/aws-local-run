@@ -33,5 +33,8 @@ testpaths = ["tests"]
 [tool.setuptools.packages.find]
 include = ["localrun*"]
 
+[tool.setuptools]
+py-modules = ["pytest_localrun"]
+
 [tool.setuptools.package-data]
 localrun = ["*.html", "*.py"]
