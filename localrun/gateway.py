@@ -385,20 +385,19 @@ def create_app() -> Flask:
             return Response(json.dumps({"error": "SES not available"}), 404, content_type="application/json")
         return Response(json.dumps({"emails": ses.inbox[-50:]}), 200, content_type="application/json")
 
+    def _serve_dashboard():
+        from localrun.dashboard import DASHBOARD_HTML
+        return Response(DASHBOARD_HTML, 200, content_type="text/html")
+
+    @app.route("/dashboard", methods=["GET"])
+    @app.route("/dashboard/", methods=["GET"])
+    def dashboard_root():
+        return _serve_dashboard()
+
     @app.route("/_localrun/ui", methods=["GET"])
     @app.route("/_localrun/ui/", methods=["GET"])
     def dashboard_ui():
-        try:
-            from localrun.dashboard import DASHBOARD_HTML
-            return Response(DASHBOARD_HTML, 200, content_type="text/html")
-        except ImportError:
-            pass
-        import os
-        html_path = os.path.join(os.path.dirname(__file__), "dashboard.html")
-        if os.path.exists(html_path):
-            with open(html_path, "r") as f:
-                return Response(f.read(), 200, content_type="text/html")
-        return Response("Dashboard HTML not found.", 404)
+        return _serve_dashboard()
 
     @app.route("/_localrun/terraform", methods=["GET"])
     def terraform_provider():
