@@ -4,6 +4,24 @@
 
 Built for developers who need fast, offline AWS testing without the overhead of full cloud emulators.
 
+## Why LocalRun over LocalStack?
+
+| Feature | LocalRun | LocalStack |
+|---------|----------|-----------|
+| Setup | `pip install` | Docker required |
+| Start time | < 1 second | 15–60 seconds |
+| Resource usage | ~30 MB RAM | 512 MB+ RAM |
+| Web dashboard | Built-in (free) | Pro tier only |
+| Price | Free / MIT | Free tier + paid Pro |
+| Pure Python | Yes | JVM + Python hybrid |
+| S3 event notifications | Yes | Yes (Pro) |
+| DynamoDB Streams + Lambda | Yes | Yes (Pro) |
+| Real CFN execution | Yes (6 core types) | Yes |
+| SQS FIFO | Yes | Yes |
+| DynamoDB GSI | Yes | Yes |
+| Lambda hot reload | Yes (--watch) | No |
+| Terraform provider | Yes (built-in) | Yes |
+
 ## Why LocalRun?
 
 - **Zero setup** — `pip install` and run. No Docker required.
@@ -11,16 +29,17 @@ Built for developers who need fast, offline AWS testing without the overhead of 
 - **Drop-in compatible** — works with `boto3`, AWS CLI, and any AWS SDK. Just set `endpoint_url`.
 - **Fast** — starts in under a second. In-memory storage, no cold starts.
 - **Pure Python** — easy to extend, debug, and contribute to.
+- **Web dashboard** — built-in visual UI at `/_localrun/ui`, free (no Pro tier needed).
 
 ## Supported Services
 
 | Service | Operations |
 |---------|-----------|
-| **S3** | Buckets, objects, copy, multi-delete, list v2, range downloads, multipart upload, pagination |
-| **SQS** | Queues, messages, purge, attributes, batch send/delete/visibility, long polling, tags |
-| **DynamoDB** | Tables, items, query, scan, batch ops, update expressions, transactions, TTL |
+| **S3** | Buckets, objects, copy, multi-delete, list v2, range downloads, multipart upload, pagination, **event notifications** |
+| **SQS** | Queues, messages, purge, attributes, batch send/delete/visibility, long polling, tags, **FIFO with deduplication** |
+| **DynamoDB** | Tables, items, query, scan, batch ops, update expressions, transactions, TTL, **GSI**, **Streams** |
 | **SNS** | Topics, subscriptions, publish, SNS→SQS fanout delivery |
-| **Lambda** | Functions, invoke (sync + async), aliases, event source mappings, permissions, CloudWatch Logs integration |
+| **Lambda** | Functions, invoke (sync + async), aliases, event source mappings, permissions, CloudWatch Logs, **hot reload** |
 | **IAM** | Roles, policies, users, inline policies, instance profiles, groups, access keys |
 | **CloudWatch Logs** | Log groups, streams, events, retention, tags, metric filters |
 | **CloudWatch Metrics** | Put/get metrics, alarms, list metrics, set alarm state |
@@ -28,7 +47,7 @@ Built for developers who need fast, offline AWS testing without the overhead of 
 | **Secrets Manager** | Secrets CRUD, versioning, rotation, tags |
 | **SSM Parameter Store** | Parameters CRUD, get-by-path, versioning, tags |
 | **EventBridge** | Rules, targets, events, event buses, SQS/SNS/Lambda routing |
-| **CloudFormation** | Stacks CRUD, describe, templates (stub) |
+| **CloudFormation** | Stacks CRUD, **real resource provisioning** for S3/SQS/DynamoDB/IAM/Lambda/SNS/SSM + intrinsic fns |
 | **RDS** | DB instances, clusters CRUD (stub) |
 | **API Gateway** | REST APIs, resources, methods, integrations, deployments, stages, Lambda proxy |
 | **OpenSearch** | Domains (control-plane), indices, documents, search, bulk, aggregations |
@@ -174,6 +193,7 @@ aws-local-run start --port 5000          # Custom port
 aws-local-run start --services s3,sqs    # Only specific services
 aws-local-run start --debug              # Debug logging
 aws-local-run start --seed seed.json     # Pre-create resources from file
+aws-local-run start --watch /path/to/fn  # Enable Lambda hot reload for a directory
 aws-local-run status                     # Check if running
 aws-local-run services                   # List all services
 aws-local-run resources                  # List all created resources
@@ -181,11 +201,15 @@ aws-local-run resources --service s3     # Filter by service
 aws-local-run export                     # Export state as CloudFormation JSON
 aws-local-run wait                       # Wait until server is ready
 aws-local-run wait --timeout 60          # Custom timeout (seconds)
+aws-local-run doctor                     # Diagnose connectivity and config
+aws-local-run doctor --port 4566         # Check a specific port
 aws-local-run fault list                 # List active fault injections
 aws-local-run fault add --service s3 --action GetObject --type error --status 500
 aws-local-run fault add --service sqs --action ReceiveMessage --type latency --delay 2000
 aws-local-run fault clear                # Remove all faults
 aws-local-run fault clear --id <uuid>    # Remove a specific fault
+aws-local-run terraform-config           # Print Terraform provider block
+aws-local-run terraform-init             # Write localrun.tf and run terraform init
 ```
 
 ### Seed File
@@ -224,6 +248,63 @@ aws-local-run start &
 aws-local-run wait --timeout 30
 # Server is ready, run tests now
 ```
+
+### Doctor Command
+
+Diagnose your LocalRun setup — checks connectivity, service health, and environment:
+
+```bash
+aws-local-run doctor
+```
+
+Output:
+```
+LocalRun Doctor
+
+  [OK] Server running at localhost:4566 (version 1.2.0)
+  [OK] Request log endpoint available
+
+  Services:
+    [OK] s3                   running
+    [OK] sqs                  running
+    ...
+
+  Environment:
+    [OK] AWS_ENDPOINT_URL=http://localhost:4566
+    [OK] AWS_ACCESS_KEY_ID=test
+    [OK] AWS_SECRET_ACCESS_KEY=test
+    [OK] AWS_DEFAULT_REGION=us-east-1
+```
+
+### Config File
+
+Instead of flags, configure LocalRun via `localrun.yaml` or `localrun.json` in the current directory:
+
+```yaml
+# localrun.yaml
+port: 4566
+region: us-east-1
+services:
+  - s3
+  - sqs
+  - dynamodb
+  - lambda
+debug: false
+```
+
+```bash
+aws-local-run start  # auto-discovers localrun.yaml
+```
+
+### Lambda Hot Reload
+
+Point `--watch` at a directory of Lambda function code. LocalRun polls for file changes and automatically re-zips and reloads any functions whose source was modified — no restart required:
+
+```bash
+aws-local-run start --watch ./src/functions
+```
+
+Any Lambda function whose `Handler` path is inside the watched directory is reloaded within a second of a file change. Great for iterative Lambda development.
 
 ## Fault Injection
 
@@ -297,6 +378,24 @@ curl http://localhost:4566/_localrun/state/snapshots
 ```
 
 State is stored as JSON (`localrun_state.json`) in `LOCALRUN_DATA_DIR`. Named snapshots are stored as `localrun_state_<name>.json`.
+
+## Web Dashboard
+
+LocalRun ships a built-in single-page web dashboard. Open it in your browser — no Pro tier needed:
+
+```
+http://localhost:4566/_localrun/ui
+```
+
+The dashboard shows:
+
+- **Overview** — services summary, request rate, total requests
+- **Services** — resource counts per service (buckets, queues, tables, functions, etc.)
+- **Requests** — live request log with service, action, status, and duration
+- **Faults** — view and remove active fault injections
+- **Config** — current configuration (region, account ID, port, enabled services)
+
+No external dependencies — pure vanilla JS, works offline.
 
 ## Request Log
 
@@ -435,6 +534,242 @@ dynamodb.transact_write_items(TransactItems=[
 result = dynamodb.transact_get_items(TransactItems=[
     {"Get": {"TableName": "orders", "Key": {"id": {"S": "1"}}}},
 ])
+```
+
+## DynamoDB GSI
+
+Query non-key attributes using Global Secondary Indexes:
+
+```python
+dynamodb = boto3.client("dynamodb", endpoint_url="http://localhost:4566", ...)
+
+dynamodb.create_table(
+    TableName="orders",
+    KeySchema=[{"AttributeName": "id", "KeyType": "HASH"}],
+    AttributeDefinitions=[
+        {"AttributeName": "id", "AttributeType": "S"},
+        {"AttributeName": "user_id", "AttributeType": "S"},
+        {"AttributeName": "created_at", "AttributeType": "S"},
+    ],
+    GlobalSecondaryIndexes=[{
+        "IndexName": "user-index",
+        "KeySchema": [
+            {"AttributeName": "user_id", "KeyType": "HASH"},
+            {"AttributeName": "created_at", "KeyType": "RANGE"},
+        ],
+        "Projection": {"ProjectionType": "ALL"},
+        "ProvisionedThroughput": {"ReadCapacityUnits": 5, "WriteCapacityUnits": 5},
+    }],
+    ProvisionedThroughput={"ReadCapacityUnits": 5, "WriteCapacityUnits": 5},
+)
+
+dynamodb.put_item(TableName="orders", Item={
+    "id": {"S": "1"}, "user_id": {"S": "alice"}, "created_at": {"S": "2024-01-01"}
+})
+
+# Query the GSI
+result = dynamodb.query(
+    TableName="orders",
+    IndexName="user-index",
+    KeyConditionExpression="user_id = :u",
+    ExpressionAttributeValues={":u": {"S": "alice"}},
+)
+```
+
+## DynamoDB Streams + Lambda
+
+Enable Streams on a table to trigger Lambda on every item change:
+
+```python
+# Create table with streams enabled
+dynamodb.create_table(
+    TableName="events",
+    KeySchema=[{"AttributeName": "id", "KeyType": "HASH"}],
+    AttributeDefinitions=[{"AttributeName": "id", "AttributeType": "S"}],
+    ProvisionedThroughput={"ReadCapacityUnits": 5, "WriteCapacityUnits": 5},
+    StreamSpecification={
+        "StreamEnabled": True,
+        "StreamViewType": "NEW_AND_OLD_IMAGES",
+    },
+)
+
+# Wire a Lambda trigger via event source mapping
+lam = boto3.client("lambda", endpoint_url="http://localhost:4566", ...)
+stream_arn = dynamodb.describe_table(TableName="events")["Table"]["LatestStreamArn"]
+
+lam.create_event_source_mapping(
+    EventSourceArn=stream_arn,
+    FunctionName="my-processor",
+    StartingPosition="TRIM_HORIZON",
+)
+
+# Every put/delete now delivers a Streams event to the Lambda
+dynamodb.put_item(TableName="events", Item={"id": {"S": "x"}, "val": {"S": "hello"}})
+# Lambda receives {"Records": [{"eventName": "INSERT", "dynamodb": {...}}]}
+```
+
+Supported `StreamViewType` values: `KEYS_ONLY`, `NEW_IMAGE`, `OLD_IMAGE`, `NEW_AND_OLD_IMAGES`.
+
+## SQS FIFO
+
+FIFO queues guarantee ordering within a message group and deduplicate within a 5-minute window:
+
+```python
+sqs = boto3.client("sqs", endpoint_url="http://localhost:4566", ...)
+
+queue_url = sqs.create_queue(
+    QueueName="orders.fifo",
+    Attributes={"FifoQueue": "true", "ContentBasedDeduplication": "false"},
+)["QueueUrl"]
+
+# Messages with the same MessageGroupId are delivered in order
+sqs.send_message(
+    QueueUrl=queue_url,
+    MessageBody="order-1",
+    MessageGroupId="customer-123",
+    MessageDeduplicationId="dedup-1",
+)
+sqs.send_message(
+    QueueUrl=queue_url,
+    MessageBody="order-2",
+    MessageGroupId="customer-123",
+    MessageDeduplicationId="dedup-2",
+)
+
+# order-1 always comes before order-2 for customer-123
+msgs = sqs.receive_message(QueueUrl=queue_url)["Messages"]
+assert msgs[0]["Body"] == "order-1"
+```
+
+## S3 Event Notifications
+
+Trigger Lambda, SQS, or SNS when objects are created or deleted in a bucket:
+
+```python
+s3 = boto3.client("s3", endpoint_url="http://localhost:4566", ...)
+
+# Notify a Lambda on every put
+s3.put_bucket_notification_configuration(
+    Bucket="uploads",
+    NotificationConfiguration={
+        "LambdaFunctionConfigurations": [{
+            "LambdaFunctionArn": "arn:aws:lambda:us-east-1:000000000000:function:processor",
+            "Events": ["s3:ObjectCreated:*"],
+        }]
+    },
+)
+
+# Or notify an SQS queue
+s3.put_bucket_notification_configuration(
+    Bucket="uploads",
+    NotificationConfiguration={
+        "QueueConfigurations": [{
+            "QueueArn": "arn:aws:sqs:us-east-1:000000000000:jobs",
+            "Events": ["s3:ObjectCreated:*", "s3:ObjectRemoved:*"],
+        }]
+    },
+)
+
+# Now every s3.put_object fires the notification
+s3.put_object(Bucket="uploads", Key="file.txt", Body=b"data")
+# Lambda is invoked / message arrives in SQS with S3 event payload
+```
+
+## Real CloudFormation Execution
+
+LocalRun actually provisions resources when you deploy a CloudFormation stack — no stub returns.
+
+Supported resource types:
+- `AWS::S3::Bucket`
+- `AWS::SQS::Queue`
+- `AWS::DynamoDB::Table`
+- `AWS::IAM::Role`
+- `AWS::Lambda::Function`
+- `AWS::SNS::Topic`
+- `AWS::SSM::Parameter`
+
+Supported intrinsic functions: `Ref`, `Fn::GetAtt`, `Fn::Sub`, `Fn::Join`
+
+```python
+cfn = boto3.client("cloudformation", endpoint_url="http://localhost:4566", ...)
+
+template = """
+AWSTemplateFormatVersion: '2010-09-09'
+Resources:
+  MyBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: my-cfn-bucket
+
+  MyQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: my-cfn-queue
+
+  MyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: my-cfn-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: []
+"""
+
+cfn.create_stack(StackName="my-stack", TemplateBody=template)
+
+# The bucket, queue, and role actually exist now
+s3 = boto3.client("s3", endpoint_url="http://localhost:4566", ...)
+s3.put_object(Bucket="my-cfn-bucket", Key="test.txt", Body=b"hello")
+```
+
+## Terraform Integration
+
+Generate a Terraform provider configuration targeting LocalRun:
+
+```bash
+# Print the provider block
+aws-local-run terraform-config
+
+# Or write localrun.tf and run terraform init automatically
+aws-local-run terraform-init
+```
+
+Generated `localrun.tf`:
+
+```hcl
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = ">= 4.0"
+    }
+  }
+}
+
+provider "aws" {
+  region                      = "us-east-1"
+  access_key                  = "test"
+  secret_key                  = "test"
+  skip_credentials_validation = true
+  skip_metadata_api_check     = true
+  skip_requesting_account_id  = true
+
+  endpoints {
+    s3             = "http://localhost:4566"
+    sqs            = "http://localhost:4566"
+    dynamodb       = "http://localhost:4566"
+    lambda         = "http://localhost:4566"
+    iam            = "http://localhost:4566"
+    cloudwatch     = "http://localhost:4566"
+    # ... all 24 services
+  }
+}
+```
+
+Or fetch the JSON config from the HTTP API and integrate with your own tooling:
+
+```bash
+curl http://localhost:4566/_localrun/terraform
 ```
 
 ## KMS Encryption
@@ -700,7 +1035,9 @@ All `/_localrun/` endpoints return JSON.
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/health` | GET | Health check — returns `{"status": "running"}` |
+| `/health` | GET | Health check — returns `{"status": "running", "version": "..."}` |
+| `/_localrun/ui` | GET | Web dashboard (HTML, no deps) |
+| `/_localrun/api/state` | GET | Dashboard API — resource counts per service |
 | `/_localrun/reset` | POST | Reset all services (add `?service=sqs` for one service) |
 | `/_localrun/faults` | GET/POST/DELETE | List, add, or remove fault injections |
 | `/_localrun/requests` | GET | Request log (add `?service=s3&limit=10`) |
@@ -710,6 +1047,7 @@ All `/_localrun/` endpoints return JSON.
 | `/_localrun/state/save/<name>` | POST | Save named snapshot |
 | `/_localrun/state/load/<name>` | POST | Load named snapshot |
 | `/_localrun/state/snapshots` | GET | List available snapshots |
+| `/_localrun/terraform` | GET | Terraform provider JSON config |
 | `/_localrun/ses/inbox` | GET | Inspect the SES inbox (last 50 emails) |
 
 ## JavaScript / Node.js Package
@@ -767,19 +1105,21 @@ pip install -e ".[dev]"
 pytest tests/ -v
 ```
 
-360 integration tests across 24 services.
+389 integration tests across 24 services.
 
 ## Project Structure
 
 ```
 localrun/
 ├── __init__.py           # Package version
-├── cli.py                # Click CLI
-├── config.py             # Configuration
-├── gateway.py            # Request routing
+├── cli.py                # Click CLI (start, status, doctor, wait, fault, terraform-*)
+├── config.py             # Configuration + localrun.yaml loader
+├── gateway.py            # Request routing + /_localrun/* endpoints
 ├── state.py              # JSON state persistence
 ├── faults.py             # Fault injection
 ├── utils.py              # Shared utilities
+├── dashboard.py          # Web dashboard HTML (served at /_localrun/ui)
+├── watcher.py            # Lambda hot reload file watcher
 └── services/
     ├── s3.py             ├── sts.py
     ├── sqs.py            ├── secretsmanager.py
