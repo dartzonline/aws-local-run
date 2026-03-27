@@ -66,6 +66,7 @@ class CloudFormationService:
         p = self._p(req)
         name = p.get("StackName", "")
         self.stacks.pop(name, None)
+        logger.info("Deleted stack: %s", name)
         return self._xml("DeleteStack", "")
 
     def _list(self, req):
@@ -92,7 +93,18 @@ class CloudFormationService:
   </Stacks>""")
 
     def _describe_resources(self, req):
-        return self._xml("DescribeStackResources", "  <StackResources></StackResources>")
+        p = self._p(req)
+        name = p.get("StackName", "")
+        s = self.stacks.get(name)
+        xml = ""
+        if s:
+            for res in s.get("Resources", []):
+                if isinstance(res, dict):
+                    lid = res.get("LogicalResourceId", "")
+                    pid = res.get("PhysicalResourceId", "")
+                    rt = res.get("ResourceType", "")
+                    xml += f"    <member><LogicalResourceId>{lid}</LogicalResourceId><PhysicalResourceId>{pid}</PhysicalResourceId><ResourceType>{rt}</ResourceType><ResourceStatus>CREATE_COMPLETE</ResourceStatus></member>\n"
+        return self._xml("DescribeStackResources", f"  <StackResources>\n{xml}  </StackResources>")
 
     def _describe_events(self, req):
         return self._xml("DescribeStackEvents", "  <StackEvents></StackEvents>")
@@ -190,6 +202,28 @@ class CloudFormationService:
                     sns.topics[arn] = SNSTopic(name=topic_name, arn=arn)
                 logger.info("CloudFormation created SNS topic: %s", topic_name)
                 return {"LogicalResourceId": logical_id, "ResourceType": res_type, "PhysicalResourceId": arn}
+
+        elif res_type == "AWS::IAM::Role":
+            iam = self.engines.get("iam")
+            if iam:
+                role_name = props.get("RoleName", logical_id)
+                if role_name not in iam.roles:
+                    arn = "arn:aws:iam::" + c.account_id + ":role/" + role_name
+                    trust = props.get("AssumeRolePolicyDocument", {})
+                    if isinstance(trust, dict):
+                        trust = json.dumps(trust)
+                    iam.roles[role_name] = {
+                        "RoleName": role_name,
+                        "Arn": arn,
+                        "CreateDate": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "AssumeRolePolicyDocument": trust,
+                        "Path": "/",
+                        "RoleId": uuid.uuid4().hex[:20].upper(),
+                    }
+                    iam.attached.setdefault(role_name, [])
+                logger.info("CloudFormation created IAM role: %s", role_name)
+                role_arn = iam.roles[role_name]["Arn"]
+                return {"LogicalResourceId": logical_id, "ResourceType": res_type, "PhysicalResourceId": role_arn}
 
         elif res_type == "AWS::SSM::Parameter":
             ssm = self.engines.get("ssm")

@@ -7,14 +7,15 @@ import requests
 from localrun import __version__
 from localrun.config import ALL_SERVICES
 
-LOGO = """
-\033[36m
-    __    ____  _________    __    ____  __  ___   __
-   / /   / __ \/ ____/   |  / /   / __ \/ / / / | / /
-  / /   / / / / /   / /| | / /   / /_/ / / / /  |/ /
- / /___/ /_/ / /___/ ___ |/ /___/ _, _/ /_/ / /|  /
-/_____/\____/\____/_/  |_/_____/_/ |_|\____/_/ |_/
-\033[0m"""
+LOGO = (
+    "\033[36m\n"
+    "    __    ____  _________    __    ____  __  ___   __\n"
+    "   / /   / __ \\/ ____/   |  / /   / __ \\/ / / / | / /\n"
+    "  / /   / / / / /   / /| | / /   / /_/ / / / /  |/ /\n"
+    " / /___/ /_/ / /___/ ___ |/ /___/ _, _/ /_/ / /|  /\n"
+    "/_____/\\____/\\____/_/  |_/_____/_/ |_|\\____/_/ |_/\n"
+    "\033[0m"
+)
 
 MENU = f"""{LOGO}
 \033[90m  AWS Local Emulator  v{__version__}\033[0m
@@ -55,7 +56,8 @@ def main(ctx):
 @click.option("--config", "config_file", default=None, help="YAML config file path")
 @click.option("--debug", is_flag=True, help="Enable debug logging")
 @click.option("--reload", is_flag=True, help="Auto-reload on config file changes")
-def start(port, host, services, data_dir, seed, config_file, debug, reload):
+@click.option("--watch", default=None, help="Directory to watch for Lambda hot reload")
+def start(port, host, services, data_dir, seed, config_file, debug, reload, watch):
     """Start the LocalRun server."""
     from localrun.config import LocalRunConfig, set_config
     from localrun.gateway import create_app
@@ -85,6 +87,14 @@ def start(port, host, services, data_dir, seed, config_file, debug, reload):
 
     if seed:
         _load_seed_file(seed, app.config.get("engines", {}))
+
+    if watch:
+        from localrun.watcher import LambdaWatcher
+        lambda_svc = app.config.get("engines", {}).get("lambda")
+        if lambda_svc:
+            watcher = LambdaWatcher(watch, lambda_svc)
+            watcher.start()
+            click.echo(f"  \033[32m➜\033[0m  Watching {watch} for Lambda hot reload\n")
 
     # Graceful shutdown: save state on SIGINT/SIGTERM
     import signal
@@ -431,3 +441,194 @@ def resources(port, service, limit):
     click.echo(f"  {'-------':<16} {'----':<20} {'----'}")
     for res in res_list:
         click.echo(f"  {res.get('service',''):<16} {res.get('type',''):<20} {res.get('name','')}")
+
+
+@main.command()
+@click.option("--port", default=4566, help="Port to check")
+@click.option("--host", default="localhost")
+def doctor(port, host):
+    """Diagnose LocalRun configuration and connectivity."""
+    ok = click.style("OK", fg="green")
+    err = click.style("FAIL", fg="red")
+
+    click.echo("LocalRun Doctor\n")
+
+    # Check health endpoint
+    health_data = {}
+    try:
+        r = requests.get(f"http://{host}:{port}/health", timeout=2)
+        if r.status_code == 200:
+            health_data = r.json()
+            version = health_data.get("version", "?")
+            click.echo(f"  [{ok}] Server running at {host}:{port} (version {version})")
+        else:
+            click.echo(f"  [{err}] Server returned status {r.status_code}")
+    except Exception as e:
+        click.echo(f"  [{err}] Cannot connect to {host}:{port}: {e}")
+        click.echo("       Fix: run 'aws-local-run start'")
+
+    # Check requests endpoint
+    try:
+        r = requests.get(f"http://{host}:{port}/_localrun/requests", timeout=2)
+        if r.status_code == 200:
+            click.echo(f"  [{ok}] Request log endpoint available")
+        else:
+            click.echo(f"  [{err}] Request log endpoint returned {r.status_code}")
+    except Exception as e:
+        click.echo(f"  [{err}] Request log unavailable: {e}")
+
+    # Print service health
+    if health_data.get("services"):
+        click.echo("\n  Services:")
+        for svc, info in health_data["services"].items():
+            click.echo(f"    [{ok}] {svc:<20} {info}")
+
+    # Check env vars
+    import os
+    click.echo("\n  Environment:")
+    for var in ("AWS_ENDPOINT_URL", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_DEFAULT_REGION"):
+        val = os.environ.get(var)
+        if val:
+            click.echo(f"  [{ok}] {var}={val[:30]}")
+        else:
+            click.echo(f"  [{err}] {var} not set")
+
+    # Check boto3
+    try:
+        import boto3
+        click.echo(f"\n  [{ok}] boto3 {boto3.__version__}")
+    except ImportError:
+        click.echo(f"\n  [{err}] boto3 not installed (pip install boto3)")
+
+    # Check pyyaml
+    try:
+        import yaml
+        click.echo(f"  [{ok}] pyyaml installed")
+    except ImportError:
+        click.echo(f"  [{err}] pyyaml not installed (pip install pyyaml) — needed for YAML config files")
+
+    # Check for config files
+    for fname in ("localrun.yaml", "localrun.yml", "localrun.json"):
+        if os.path.isfile(fname):
+            click.echo(f"  [{ok}] Config file found: {fname}")
+            break
+    else:
+        click.echo(f"  [   ] No localrun.yaml/json found in current directory")
+
+    click.echo("\nDone.")
+
+
+_ALL_24_SERVICES = [
+    "s3", "sqs", "dynamodb", "sns", "lambda", "iam", "logs", "sts",
+    "secretsmanager", "ssm", "events", "cloudformation", "rds", "apigateway",
+    "opensearch", "kinesis", "cloudwatch", "stepfunctions", "ses", "cognito",
+    "kms", "ec2", "acm", "route53",
+]
+
+
+@main.command("terraform-config")
+@click.option("--port", default=4566)
+@click.option("--region", default="us-east-1")
+def terraform_config(port, region):
+    """Print Terraform AWS provider config for LocalRun."""
+    endpoint = f"http://localhost:{port}"
+    lines = [
+        'provider "aws" {',
+        f'  region                      = "{region}"',
+        '  access_key                  = "test"',
+        '  secret_key                  = "test"',
+        '  skip_credentials_validation = true',
+        '  skip_metadata_api_check     = true',
+        '  skip_requesting_account_id  = true',
+        '',
+        '  endpoints {',
+    ]
+    svc_map = {
+        "s3": "s3", "sqs": "sqs", "dynamodb": "dynamodb", "sns": "sns",
+        "lambda": "lambda", "iam": "iam", "logs": "cloudwatchlogs",
+        "sts": "sts", "secretsmanager": "secretsmanager", "ssm": "ssm",
+        "events": "cloudwatchevents", "cloudformation": "cloudformation",
+        "rds": "rds", "apigateway": "apigateway", "opensearch": "opensearch",
+        "kinesis": "kinesis", "cloudwatch": "cloudwatch",
+        "stepfunctions": "sfn", "ses": "ses", "cognito": "cognitoidp",
+        "kms": "kms", "ec2": "ec2", "acm": "acm", "route53": "route53",
+    }
+    for svc, tf_name in svc_map.items():
+        lines.append(f'    {tf_name:<24} = "{endpoint}"')
+    lines.extend(['  }', '}'])
+    click.echo("\n".join(lines))
+
+
+@main.command("terraform-init")
+@click.option("--dir", "target_dir", default=".", help="Directory to write localrun.tf")
+@click.option("--port", default=4566)
+@click.option("--region", default="us-east-1")
+@click.option("--cdktf", is_flag=True, help="Print CDK for Terraform TypeScript instead")
+def terraform_init(target_dir, port, region, cdktf):
+    """Write localrun.tf to a directory (or print CDKTF snippet)."""
+    import os
+    endpoint = f"http://localhost:{port}"
+
+    if cdktf:
+        snippet = f"""// CDK for Terraform — LocalRun provider config
+import {{ AwsProvider }} from "@cdktf/provider-aws/lib/provider";
+
+new AwsProvider(this, "LocalRun", {{
+  region: "{region}",
+  accessKey: "test",
+  secretKey: "test",
+  skipCredentialsValidation: true,
+  skipMetadataApiCheck: "true",
+  skipRequestingAccountId: true,
+  endpoints: [{{
+    s3: "{endpoint}",
+    sqs: "{endpoint}",
+    dynamodb: "{endpoint}",
+    sns: "{endpoint}",
+    lambda: "{endpoint}",
+    iam: "{endpoint}",
+  }}],
+}});"""
+        click.echo(snippet)
+        return
+
+    tf_content = f"""provider "aws" {{
+  region                      = "{region}"
+  access_key                  = "test"
+  secret_key                  = "test"
+  skip_credentials_validation = true
+  skip_metadata_api_check     = true
+  skip_requesting_account_id  = true
+
+  endpoints {{
+    s3               = "{endpoint}"
+    sqs              = "{endpoint}"
+    dynamodb         = "{endpoint}"
+    sns              = "{endpoint}"
+    lambda           = "{endpoint}"
+    iam              = "{endpoint}"
+    cloudwatchlogs   = "{endpoint}"
+    sts              = "{endpoint}"
+    secretsmanager   = "{endpoint}"
+    ssm              = "{endpoint}"
+    cloudwatchevents = "{endpoint}"
+    cloudformation   = "{endpoint}"
+    rds              = "{endpoint}"
+    apigateway       = "{endpoint}"
+    opensearch       = "{endpoint}"
+    kinesis          = "{endpoint}"
+    cloudwatch       = "{endpoint}"
+    sfn              = "{endpoint}"
+    ses              = "{endpoint}"
+    cognitoidp       = "{endpoint}"
+    kms              = "{endpoint}"
+    ec2              = "{endpoint}"
+    acm              = "{endpoint}"
+    route53          = "{endpoint}"
+  }}
+}}
+"""
+    out_path = os.path.join(target_dir, "localrun.tf")
+    with open(out_path, "w") as f:
+        f.write(tf_content)
+    click.echo(f"Written: {out_path}")

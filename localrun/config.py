@@ -85,6 +85,56 @@ class LocalRunConfig:
         logger.info("Loaded config from %s", path)
 
 
+def load_config_file(path=None):
+    """Load config from a localrun.yaml/yml/json file. Returns a dict."""
+    import os
+    if path is None:
+        for fname in ("localrun.yaml", "localrun.yml", "localrun.json"):
+            if os.path.isfile(fname):
+                path = fname
+                break
+    if path is None:
+        return {}
+    if path.endswith(".json"):
+        import json
+        try:
+            with open(path) as f:
+                return json.load(f) or {}
+        except Exception as e:
+            logger.warning("Failed to load config file %s: %s", path, e)
+            return {}
+    try:
+        import yaml
+    except ImportError:
+        raise ImportError("pyyaml is required for YAML config files: pip install pyyaml")
+    try:
+        with open(path) as f:
+            return yaml.safe_load(f) or {}
+    except Exception as e:
+        logger.warning("Failed to load config file %s: %s", path, e)
+        return {}
+
+
+def merge_config(base_config, file_config):
+    """Merge file_config values into base_config. file_config has lower precedence than CLI."""
+    if not file_config:
+        return base_config
+    if "port" in file_config and base_config.port == 4566:
+        base_config.port = int(file_config["port"])
+    if "region" in file_config and base_config.region == "us-east-1":
+        base_config.region = file_config["region"]
+    if "debug" in file_config and not base_config.debug:
+        base_config.debug = bool(file_config["debug"])
+    if "services" in file_config:
+        svc_list = file_config["services"]
+        if isinstance(svc_list, list):
+            for s in ALL_SERVICES:
+                base_config.enabled_services[s] = False
+            for s in svc_list:
+                base_config.enabled_services[s.strip()] = True
+    return base_config
+
+
 _config = None
 
 

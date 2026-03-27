@@ -855,11 +855,11 @@ class S3Service:
             for e in lc.get("Events", []):
                 events_xml += f"<Event>{e}</Event>"
             lambda_xml += (
-                f"\n  <CloudFunctionConfiguration>"
+                f"\n  <LambdaFunctionConfiguration>"
                 f"<Id>{lc.get('Id', '')}</Id>"
-                f"<CloudFunction>{lc.get('LambdaFunctionArn', '')}</CloudFunction>"
+                f"<LambdaFunctionArn>{lc.get('LambdaFunctionArn', '')}</LambdaFunctionArn>"
                 f"{events_xml}"
-                f"</CloudFunctionConfiguration>"
+                f"</LambdaFunctionConfiguration>"
             )
         body = (
             f'<?xml version="1.0" encoding="UTF-8"?>\n'
@@ -877,22 +877,37 @@ class S3Service:
             root = ET.fromstring(raw)
         except ET.ParseError:
             return _s3_err("MalformedXML", "The XML you provided was not well-formed.", 400)
+        ns = S3_NS
         config = {"QueueConfigurations": [], "TopicConfigurations": [], "LambdaFunctionConfigurations": []}
-        for qc in root.findall("QueueConfiguration"):
-            item = {"Id": _xml_text(qc, "Id"), "QueueArn": _xml_text(qc, "Queue"), "Events": []}
-            for e in qc.findall("Event"):
+        qcs = root.findall(f"{{{ns}}}QueueConfiguration") or root.findall("QueueConfiguration")
+        for qc in qcs:
+            item = {"Id": _xml_text(qc, "Id", ns), "QueueArn": _xml_text(qc, "Queue", ns), "Events": []}
+            evts = qc.findall(f"{{{ns}}}Event") or qc.findall("Event")
+            for e in evts:
                 if e.text:
                     item["Events"].append(e.text)
             config["QueueConfigurations"].append(item)
-        for tc in root.findall("TopicConfiguration"):
-            item = {"Id": _xml_text(tc, "Id"), "TopicArn": _xml_text(tc, "Topic"), "Events": []}
-            for e in tc.findall("Event"):
+        tcs = root.findall(f"{{{ns}}}TopicConfiguration") or root.findall("TopicConfiguration")
+        for tc in tcs:
+            item = {"Id": _xml_text(tc, "Id", ns), "TopicArn": _xml_text(tc, "Topic", ns), "Events": []}
+            evts = tc.findall(f"{{{ns}}}Event") or tc.findall("Event")
+            for e in evts:
                 if e.text:
                     item["Events"].append(e.text)
             config["TopicConfigurations"].append(item)
-        for lc in root.findall("CloudFunctionConfiguration"):
-            item = {"Id": _xml_text(lc, "Id"), "LambdaFunctionArn": _xml_text(lc, "CloudFunction"), "Events": []}
-            for e in lc.findall("Event"):
+        cfs = root.findall(f"{{{ns}}}CloudFunctionConfiguration") or root.findall("CloudFunctionConfiguration")
+        for lc in cfs:
+            item = {"Id": _xml_text(lc, "Id", ns), "LambdaFunctionArn": _xml_text(lc, "CloudFunction", ns), "Events": []}
+            evts = lc.findall(f"{{{ns}}}Event") or lc.findall("Event")
+            for e in evts:
+                if e.text:
+                    item["Events"].append(e.text)
+            config["LambdaFunctionConfigurations"].append(item)
+        lfs = root.findall(f"{{{ns}}}LambdaFunctionConfiguration") or root.findall("LambdaFunctionConfiguration")
+        for lc in lfs:
+            item = {"Id": _xml_text(lc, "Id", ns), "LambdaFunctionArn": _xml_text(lc, "LambdaFunctionArn", ns), "Events": []}
+            evts = lc.findall(f"{{{ns}}}Event") or lc.findall("Event")
+            for e in evts:
                 if e.text:
                     item["Events"].append(e.text)
             config["LambdaFunctionConfigurations"].append(item)
@@ -1021,8 +1036,10 @@ class S3Service:
 
 # ─── Module-level helpers ─────────────────────────────────────────────────────
 
-def _xml_text(elem, tag):
-    child = elem.find(tag)
+def _xml_text(elem, tag, ns=None):
+    child = elem.find(f"{{{ns}}}{tag}") if ns else None
+    if child is None:
+        child = elem.find(tag)
     return child.text if (child is not None and child.text) else ""
 
 

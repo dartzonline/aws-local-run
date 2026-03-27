@@ -386,13 +386,33 @@ def create_app() -> Flask:
         return Response(json.dumps({"emails": ses.inbox[-50:]}), 200, content_type="application/json")
 
     @app.route("/_localrun/ui", methods=["GET"])
+    @app.route("/_localrun/ui/", methods=["GET"])
     def dashboard_ui():
+        try:
+            from localrun.dashboard import DASHBOARD_HTML
+            return Response(DASHBOARD_HTML, 200, content_type="text/html")
+        except ImportError:
+            pass
         import os
         html_path = os.path.join(os.path.dirname(__file__), "dashboard.html")
         if os.path.exists(html_path):
             with open(html_path, "r") as f:
                 return Response(f.read(), 200, content_type="text/html")
         return Response("Dashboard HTML not found.", 404)
+
+    @app.route("/_localrun/terraform", methods=["GET"])
+    def terraform_provider():
+        c = get_config()
+        endpoint = f"http://localhost:{c.port}"
+        services_map = {}
+        for svc in c.enabled_services:
+            services_map[svc] = endpoint
+        return Response(json.dumps({
+            "provider": "aws",
+            "region": c.region,
+            "endpoint": endpoint,
+            "services": services_map,
+        }), 200, content_type="application/json")
 
     @app.route("/_localrun/api/state", methods=["GET"])
     def dashboard_api():
