@@ -4,6 +4,8 @@
 
 Built for developers who need fast, offline AWS testing without the overhead of full cloud emulators.
 
+![LocalRun Dashboard](docs/ss.png)
+
 ## Why LocalRun over LocalStack?
 
 | Feature | LocalRun | LocalStack |
@@ -381,21 +383,27 @@ State is stored as JSON (`localrun_state.json`) in `LOCALRUN_DATA_DIR`. Named sn
 
 ## Web Dashboard
 
-LocalRun ships a built-in single-page web dashboard. Open it in your browser — no Pro tier needed:
+LocalRun ships a built-in single-page web dashboard at:
 
 ```
-http://localhost:4566/_localrun/ui
+http://localhost:4566/dashboard
 ```
 
-The dashboard shows:
+No Pro tier, no Docker, no external dependencies — pure vanilla JS.
 
-- **Overview** — services summary, request rate, total requests
-- **Services** — resource counts per service (buckets, queues, tables, functions, etc.)
-- **Requests** — live request log with service, action, status, and duration
-- **Faults** — view and remove active fault injections
-- **Config** — current configuration (region, account ID, port, enabled services)
+![LocalRun Dashboard](docs/ss.png)
 
-No external dependencies — pure vanilla JS, works offline.
+**Overview tab** — stats row (total services, resource count, request count, error count, avg latency) and service cards with icons. Each card shows live resource counts and expands on click to list individual resources (bucket names, queue names, table names, etc.).
+
+**Resources tab** — filterable table of all created resources across all services. Filter by name or service. Click any row to expand the full JSON details.
+
+**Requests tab** — live request log showing service, action, HTTP method, status code (color-coded), and duration. Filter by service, status class (2xx/4xx), or action name. Auto-refreshes every 4 seconds.
+
+**Faults tab** — inject errors or latency into any service/action with configurable probability. Lists all active faults with delete buttons.
+
+**Config tab** — server info, service list, and a live Terraform provider block you can copy-paste directly into your `.tf` files. Also has a "Reset All State" button for test isolation.
+
+The header shows a green/red health indicator, server version, and a manual Refresh button alongside an Auto toggle.
 
 ## Request Log
 
@@ -1036,7 +1044,8 @@ All `/_localrun/` endpoints return JSON.
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/health` | GET | Health check — returns `{"status": "running", "version": "..."}` |
-| `/_localrun/ui` | GET | Web dashboard (HTML, no deps) |
+| `/dashboard` | GET | Web dashboard (canonical URL) |
+| `/_localrun/ui` | GET | Web dashboard (alias) |
 | `/_localrun/api/state` | GET | Dashboard API — resource counts per service |
 | `/_localrun/reset` | POST | Reset all services (add `?service=sqs` for one service) |
 | `/_localrun/faults` | GET/POST/DELETE | List, add, or remove fault injections |
