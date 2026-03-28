@@ -6,24 +6,6 @@ Built for developers who need fast, offline AWS testing without the overhead of 
 
 ![LocalRun Dashboard](docs/ss.png)
 
-## Why LocalRun over LocalStack?
-
-| Feature | LocalRun | LocalStack |
-|---------|----------|-----------|
-| Setup | `pip install` | Docker required |
-| Start time | < 1 second | 15–60 seconds |
-| Resource usage | ~30 MB RAM | 512 MB+ RAM |
-| Web dashboard | Built-in (free) | Pro tier only |
-| Price | Free / MIT | Free tier + paid Pro |
-| Pure Python | Yes | JVM + Python hybrid |
-| S3 event notifications | Yes | Yes (Pro) |
-| DynamoDB Streams + Lambda | Yes | Yes (Pro) |
-| Real CFN execution | Yes (6 core types) | Yes |
-| SQS FIFO | Yes | Yes |
-| DynamoDB GSI | Yes | Yes |
-| Lambda hot reload | Yes (--watch) | No |
-| Terraform provider | Yes (built-in) | Yes |
-
 ## Why LocalRun?
 
 - **Zero setup** — `pip install` and run. No Docker required.
